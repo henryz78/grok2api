@@ -22,6 +22,7 @@ from app.dataplane.reverse.protocol.xai_console import (
     build_console_input,
     convert_openai_tool_choice,
     convert_openai_tools_to_console,
+    extract_console_sse_error,
     extract_console_usage,
     inject_web_search_tool,
 )
@@ -341,6 +342,9 @@ async def _console_responses_dispatch(
                                     data = raw_line[5:].strip()
                                     if data == "[DONE]":
                                         break
+                                    exc = extract_console_sse_error(current_event, data)
+                                    if exc is not None:
+                                        raise exc
                                     if current_event:
                                         yield f"event: {current_event}\ndata: {data}\n\n"
                                     else:

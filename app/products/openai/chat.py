@@ -48,6 +48,7 @@ from app.dataplane.reverse.protocol.xai_console import (
     extract_console_text,
     extract_console_tool_calls,
     extract_console_usage,
+    normalize_console_usage,
     inject_web_search_tool,
     parse_console_error,
 )
@@ -866,10 +867,15 @@ async def _console_completions(
         usage,
     )
 
-    # Use upstream usage when available; fall back to estimation otherwise.
-    pt = usage.get("prompt_tokens") or estimate_prompt_tokens(prompt_text)
-    ct = usage.get("completion_tokens") or estimate_tokens(full_text)
-    rt = usage.get("reasoning_tokens") or (estimate_tokens(full_thinking) if full_thinking else 0)
+    normalized_usage = normalize_console_usage(
+        usage,
+        prompt_tokens_fallback=estimate_prompt_tokens(prompt_text),
+        completion_tokens_fallback=estimate_tokens(full_text),
+        reasoning_tokens_fallback=(estimate_tokens(full_thinking) if full_thinking else 0),
+    )
+    pt = normalized_usage["prompt_tokens"]
+    ct = normalized_usage["completion_tokens"]
+    rt = normalized_usage["reasoning_tokens"]
 
     # If upstream returned tool calls, return the tool_calls response variant.
     if response_tool_calls:
@@ -886,7 +892,7 @@ async def _console_completions(
             parsed_calls,
             prompt_content=prompt_text,
             response_id=response_id,
-            usage=build_usage(pt, ct + rt, reasoning_tokens=rt),
+            usage=build_usage(pt, ct, reasoning_tokens=rt),
         )
         if response_search_sources:
             resp["search_sources"] = response_search_sources
@@ -901,7 +907,7 @@ async def _console_completions(
         reasoning_content=full_thinking or None,
         search_sources=response_search_sources or None,
         annotations=chat_anns,
-        usage=build_usage(pt, ct + rt, reasoning_tokens=rt),
+        usage=build_usage(pt, ct, reasoning_tokens=rt),
     )
 
 

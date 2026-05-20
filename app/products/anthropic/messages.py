@@ -279,6 +279,17 @@ def _build_message_response(
     }
 
 
+def _attach_annotations_to_content(content: list[dict], annotations: Any) -> list[dict]:
+    if not annotations:
+        return content
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            block["annotations"] = annotations
+            return content
+    content.insert(0, {"type": "text", "text": "", "annotations": annotations})
+    return content
+
+
 # ---------------------------------------------------------------------------
 # Chat Completions → Anthropic Messages conversion (used for console dispatch)
 # ---------------------------------------------------------------------------
@@ -294,6 +305,7 @@ def _chat_completion_to_anthropic(
     message = choice.get("message") or {}
     text = message.get("content") or ""
     tool_calls = message.get("tool_calls") or []
+    annotations = message.get("annotations") or []
 
     content: list[dict] = []
     if text:
@@ -317,12 +329,13 @@ def _chat_completion_to_anthropic(
     if not content:
         # Anthropic requires at least one content block
         content = [{"type": "text", "text": ""}]
+    _attach_annotations_to_content(content, annotations)
 
     finish = choice.get("finish_reason")
     stop_reason = _finish_reason_to_stop_reason(finish)
 
     usage = chat_response.get("usage") or {}
-    return _build_message_response(
+    response = _build_message_response(
         msg_id,
         model,
         content,
@@ -330,6 +343,10 @@ def _chat_completion_to_anthropic(
         input_tokens=int(usage.get("prompt_tokens", 0)),
         output_tokens=int(usage.get("completion_tokens", 0)),
     )
+    search_sources = chat_response.get("search_sources") or []
+    if search_sources:
+        response["search_sources"] = search_sources
+    return response
 
 
 async def _chat_stream_to_anthropic_sse(
@@ -370,6 +387,8 @@ async def _chat_stream_to_anthropic_sse(
     full_text = ""
     output_tokens = 0
     final_stop_reason = "end_turn"
+    final_annotations: list[dict] = []
+    final_search_sources: list[dict] = []
 
     async for chunk_line in chat_stream:
         if not chunk_line.startswith("data:"):
@@ -390,6 +409,9 @@ async def _chat_stream_to_anthropic_sse(
             continue
         choice = choices[0]
         delta = choice.get("delta") or {}
+        annotations = delta.get("annotations") or []
+        if annotations:
+            final_annotations = annotations
 
         # Text content delta
         text = delta.get("content")
@@ -469,6 +491,9 @@ async def _chat_stream_to_anthropic_sse(
         usage = chunk.get("usage") or {}
         if usage:
             output_tokens = int(usage.get("completion_tokens") or 0)
+        search_sources = chunk.get("search_sources") or []
+        if search_sources:
+            final_search_sources = search_sources
 
     # Close all open content blocks
     if text_block_open:
@@ -486,13 +511,19 @@ async def _chat_stream_to_anthropic_sse(
         # If upstream didn't set finish_reason=tool_calls, force tool_use
         final_stop_reason = "tool_use"
 
+    delta_payload: dict[str, Any] = {
+        "stop_reason": final_stop_reason,
+        "stop_sequence": None,
+    }
+    if final_annotations:
+        delta_payload["annotations"] = final_annotations
+    if final_search_sources:
+        delta_payload["search_sources"] = final_search_sources
+
     yield _sse(
         "message_delta", {
             "type": "message_delta",
-            "delta": {
-                "stop_reason": final_stop_reason,
-                "stop_sequence": None
-            },
+            "delta": delta_payload,
             "usage": {
                 "output_tokens": output_tokens or estimate_tokens(full_text),
             },

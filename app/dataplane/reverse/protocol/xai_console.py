@@ -41,6 +41,7 @@ from typing import Any
 
 import orjson
 
+from app.platform.errors import ValidationError
 from app.platform.errors import UpstreamError
 from app.platform.logging.logger import logger
 
@@ -193,6 +194,11 @@ def _convert_content_blocks(
                     "image_url": url,
                     "detail": detail,
                 })
+        elif btype in ("file", "input_audio"):
+            raise ValidationError(
+                f"Console models do not support {btype} content blocks yet",
+                param="messages",
+            )
         elif btype in ("input_text", "output_text", "input_image"):
             # Already in console format — pass through
             blocks.append(dict(block))
@@ -534,6 +540,29 @@ def extract_console_usage(response_json: dict[str, Any]) -> dict[str, int]:
     }
 
 
+def normalize_console_usage(
+    usage: dict[str, int] | None,
+    *,
+    prompt_tokens_fallback: int,
+    completion_tokens_fallback: int,
+    reasoning_tokens_fallback: int,
+) -> dict[str, int]:
+    """Normalize console usage with sane fallbacks.
+
+    ``completion_tokens`` from upstream already includes reasoning tokens, so
+    callers must not add ``reasoning_tokens`` again when building usage.
+    """
+    usage = usage or {}
+    prompt_tokens = int(usage.get("prompt_tokens") or prompt_tokens_fallback)
+    completion_tokens = int(usage.get("completion_tokens") or completion_tokens_fallback)
+    reasoning_tokens = int(usage.get("reasoning_tokens") or reasoning_tokens_fallback)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "reasoning_tokens": reasoning_tokens,
+    }
+
+
 def parse_console_error(status_code: int, body: str) -> UpstreamError:
     """Convert a non-200 console response into an UpstreamError."""
     message = f"Console upstream returned {status_code}"
@@ -548,6 +577,29 @@ def parse_console_error(status_code: int, body: str) -> UpstreamError:
     except (orjson.JSONDecodeError, ValueError, TypeError):
         pass
     return UpstreamError(message, status=status_code, body=body[:400])
+
+
+def extract_console_sse_error(event_name: str, data: str) -> UpstreamError | None:
+    """Parse a console SSE event and return an UpstreamError when it is fatal."""
+    if event_name not in ("response.failed", "response.error", "response.cancelled", "error"):
+        return None
+
+    message = "Console stream error"
+    try:
+        obj = orjson.loads(data)
+    except (orjson.JSONDecodeError, ValueError, TypeError):
+        obj = {}
+
+    if isinstance(obj, dict):
+        err = obj.get("error") or obj.get("response", {}).get("error") or {}
+        if isinstance(err, dict):
+            message = str(err.get("message") or err.get("code") or message)
+        elif err:
+            message = str(err)
+        elif obj.get("type") == "response.cancelled":
+            message = "Console stream cancelled"
+
+    return UpstreamError(message, status=502, body=str(data)[:400])
 
 
 # ---------------------------------------------------------------------------
@@ -831,7 +883,9 @@ __all__ = [
     "extract_console_annotations",
     "extract_console_search_sources",
     "extract_console_usage",
+    "normalize_console_usage",
     "parse_console_error",
+    "extract_console_sse_error",
     "classify_console_sse_line",
     "ConsoleStreamAdapter",
 ]
