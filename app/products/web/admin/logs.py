@@ -1,5 +1,6 @@
 """File-based log browsing for the self-serve admin console."""
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,13 @@ from fastapi import APIRouter, Query
 from app.platform.paths import log_dir
 
 router = APIRouter(prefix="/logs", tags=["Admin - Logs"])
+
+_LOG_LINE_RE = re.compile(
+    r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\s+\|\s+"
+    r"(?P<level>[A-Z]+)\s+\|\s+"
+    r"(?P<source>.+?)\s+-\s+"
+    r"(?P<message>.*)$"
+)
 
 
 def _list_log_files() -> list[Path]:
@@ -22,18 +30,22 @@ def _list_log_files() -> list[Path]:
 
 
 def _parse_line(file_name: str, raw: str) -> dict[str, Any]:
-    parts = raw.split(" | ", 3)
-    if len(parts) == 4:
-        ts, level, source, message = parts
+    text = raw.strip()
+    match = _LOG_LINE_RE.match(text)
+    if match:
+        ts = match.group("timestamp")
+        level = match.group("level")
+        source = match.group("source")
+        message = match.group("message")
     else:
-        ts, level, source, message = "", "", "", raw
+        ts, level, source, message = "", "", "", text
     return {
         "file": file_name,
         "timestamp": ts.strip(),
         "level": level.strip(),
         "source": source.strip(),
         "message": message.strip(),
-        "raw": raw,
+        "raw": text,
     }
 
 
