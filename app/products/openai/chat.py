@@ -44,7 +44,7 @@ from app.dataplane.reverse.protocol.xai_console import (
     convert_openai_tool_choice,
     convert_openai_tools_to_console,
     extract_console_annotations,
-    extract_console_reasoning,
+    format_console_reasoning,
     extract_console_search_sources,
     extract_console_text,
     extract_console_tool_calls,
@@ -861,7 +861,7 @@ async def _console_completions(
                     ) from exc
 
                 full_text = extract_console_text(response_json)
-                full_thinking = (extract_console_reasoning(response_json) if emit_think else "")
+                full_thinking = (format_console_reasoning(response_json) if emit_think else "")
                 response_tool_calls = extract_console_tool_calls(response_json)
                 response_annotations = extract_console_annotations(response_json)
                 response_search_sources = extract_console_search_sources(response_json)

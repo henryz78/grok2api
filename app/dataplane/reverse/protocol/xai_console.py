@@ -45,6 +45,28 @@ from app.platform.errors import ValidationError
 from app.platform.errors import UpstreamError
 from app.platform.logging.logger import logger
 
+_CONSOLE_REASONING_HEADER = "Thinking about your request"
+_DISPLAY_ARG_KEYS = (
+    "query",
+    "q",
+    "search_query",
+    "url",
+    "message",
+    "instructions",
+    "input",
+    "location",
+)
+_SEARCH_CALL_TYPES = {
+    "web_search_call": "web_search",
+    "x_search_call": "x_search",
+    "x_keyword_search_call": "x_search",
+    "x_semantic_search_call": "x_search",
+}
+_TOOL_EMOJI = {
+    "web_search": "🔍",
+    "x_search": "🔍",
+}
+
 # ---------------------------------------------------------------------------
 # Input conversion (OpenAI Chat Completions → console.x.ai input array)
 # ---------------------------------------------------------------------------
@@ -367,6 +389,128 @@ def extract_console_reasoning(response_json: dict[str, Any]) -> str:
     return ""
 
 
+def _parse_tool_arguments(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        obj = orjson.loads(raw)
+    except (orjson.JSONDecodeError, ValueError, TypeError):
+        return {"input": raw}
+    return obj if isinstance(obj, dict) else {"input": obj}
+
+
+def _stringify_tool_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    try:
+        return orjson.dumps(value).decode("utf-8")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _first_display_arg(args: dict[str, Any]) -> str:
+    for key in _DISPLAY_ARG_KEYS:
+        value = args.get(key)
+        text = _stringify_tool_value(value)
+        if text:
+            return text
+    sources = args.get("sources")
+    if isinstance(sources, list):
+        for src in sources:
+            if not isinstance(src, dict):
+                continue
+            text = _stringify_tool_value(src.get("title") or src.get("url"))
+            if text:
+                return text
+    return ""
+
+
+def _format_console_tool_trace(tool_name: str, args: dict[str, Any] | None = None) -> str:
+    name = (tool_name or "tool").strip()
+    if not name:
+        return ""
+    args = args or {}
+    display_arg = _first_display_arg(args)
+    emoji = _TOOL_EMOJI.get(name, "🔧")
+    if display_arg:
+        return f"{emoji} {name}: {display_arg}"
+    return f"{emoji} {name}"
+
+
+def _iter_console_trace_lines(response_json: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    seen: set[str] = set()
+    for item in response_json.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type") or ""
+        line = ""
+        if item_type in _SEARCH_CALL_TYPES:
+            action = item.get("action") if isinstance(item.get("action"), dict) else {}
+            line = _format_console_tool_trace(_SEARCH_CALL_TYPES[item_type], action)
+        elif item_type == "function_call":
+            args = _parse_tool_arguments(item.get("arguments"))
+            line = _format_console_tool_trace(item.get("name") or "function_call", args)
+        elif isinstance(item_type, str) and item_type.endswith("_call"):
+            action = item.get("action") if isinstance(item.get("action"), dict) else item
+            line = _format_console_tool_trace(item_type[:-5], action)
+        key = line.strip().lower()
+        if line and key not in seen:
+            seen.add(key)
+            lines.append(line)
+    return lines
+
+
+def format_console_reasoning(response_json: dict[str, Any]) -> str:
+    """Return visible reasoning text, synthesizing tool/search traces if needed."""
+    parts: list[str] = []
+    actual = extract_console_reasoning(response_json).strip()
+    trace_lines = _iter_console_trace_lines(response_json)
+    if actual:
+        parts.append(actual)
+    if trace_lines:
+        if not actual:
+            parts.append(_CONSOLE_REASONING_HEADER)
+        parts.extend(trace_lines)
+    elif not actual and extract_console_usage(response_json).get("reasoning_tokens", 0) > 0:
+        parts.append(_CONSOLE_REASONING_HEADER)
+    if not parts:
+        return ""
+    return "\n".join(parts).rstrip() + "\n"
+
+
+def inject_console_reasoning_output(response_json: dict[str, Any]) -> dict[str, Any]:
+    """Insert a synthetic Responses API reasoning item when upstream omits one."""
+    if extract_console_reasoning(response_json):
+        return response_json
+    reasoning = format_console_reasoning(response_json)
+    if not reasoning:
+        return response_json
+    output = response_json.get("output")
+    if not isinstance(output, list):
+        return response_json
+    updated = dict(response_json)
+    updated["output"] = [
+        {
+            "id": "rs_console_synthetic",
+            "type": "reasoning",
+            "summary": [{
+                "type": "summary_text",
+                "text": reasoning.rstrip(),
+            }],
+            "status": "completed",
+        },
+        *output,
+    ]
+    return updated
+
+
 def extract_console_tool_calls(response_json: dict[str, Any], ) -> list[dict[str, Any]]:
     """Extract tool calls from a non-streaming response.
 
@@ -653,6 +797,8 @@ class ConsoleStreamAdapter:
         "_active_tool_index",
         "_tool_args_buf",
         "_seen_source_urls",
+        "_reasoning_header_emitted",
+        "_reasoning_line_keys",
         "tool_calls",
         "annotations",
         "search_sources",
@@ -666,6 +812,8 @@ class ConsoleStreamAdapter:
         self._active_tool_index: dict[str, int] = {}  # item_id → index
         self._tool_args_buf: dict[str, list[str]] = {}  # item_id → args chunks
         self._seen_source_urls: set[str] = set()
+        self._reasoning_header_emitted = False
+        self._reasoning_line_keys: set[str] = set()
         self.tool_calls: list[dict[str, Any]] = []
         self.annotations: list[dict[str, Any]] = []
         self.search_sources: list[dict[str, Any]] = []
@@ -721,6 +869,7 @@ class ConsoleStreamAdapter:
         ):
             delta = obj.get("delta") or ""
             if isinstance(delta, str) and delta:
+                self._reasoning_header_emitted = True
                 self.thinking_buf.append(delta)
                 return {"kind": "thinking", "content": delta}
             return {"kind": "skip"}
@@ -752,10 +901,11 @@ class ConsoleStreamAdapter:
                 }
             return {"kind": "skip"}
 
-        # ── Web search call done — collect sources ───────────────────────────
+        # ── Search call done — collect sources and expose a visible trace ────
         if ev == "response.output_item.done" or obj.get("type") == "response.output_item.done":
             item = obj.get("item") or {}
-            if isinstance(item, dict) and item.get("type") == "web_search_call":
+            item_type = item.get("type") if isinstance(item, dict) else ""
+            if isinstance(item, dict) and item_type == "web_search_call":
                 action = item.get("action") or {}
                 if isinstance(action, dict):
                     for src in action.get("sources") or []:
@@ -776,6 +926,10 @@ class ConsoleStreamAdapter:
                                 "url": url,
                                 "title": "",
                             })
+            if isinstance(item, dict) and item_type in _SEARCH_CALL_TYPES:
+                action = item.get("action") if isinstance(item.get("action"), dict) else {}
+                line = _format_console_tool_trace(_SEARCH_CALL_TYPES[item_type], action)
+                return self._synthetic_reasoning_event(line)
             return {"kind": "skip"}
 
         # ── Tool call argument delta ──────────────────────────────────────────
@@ -803,6 +957,11 @@ class ConsoleStreamAdapter:
             if not isinstance(final_args, str) or not final_args:
                 final_args = "".join(self._tool_args_buf.get(item_id, []))
             self.tool_calls[idx]["function"]["arguments"] = final_args
+            name = self.tool_calls[idx]["function"].get("name") or "function_call"
+            line = _format_console_tool_trace(name, _parse_tool_arguments(final_args))
+            event = self._synthetic_reasoning_event(line)
+            if event.get("kind") != "skip":
+                return event
             return {"kind": "tool_call_done", "index": idx}
 
         # ── URL citation annotation ───────────────────────────────────────────
@@ -870,6 +1029,27 @@ class ConsoleStreamAdapter:
         """Return collected usage tokens (populated after stream completion)."""
         return dict(self._usage)
 
+    def _synthetic_reasoning_event(self, line: str) -> dict[str, Any]:
+        text = (line or "").strip()
+        if not text:
+            return {"kind": "skip"}
+        key = text.lower()
+        if key in self._reasoning_line_keys:
+            return {"kind": "skip"}
+        self._reasoning_line_keys.add(key)
+
+        chunks: list[str] = []
+        if not self._reasoning_header_emitted and not self.thinking_buf:
+            header = _CONSOLE_REASONING_HEADER + "\n"
+            chunks.append(header)
+            self.thinking_buf.append(header)
+            self._reasoning_header_emitted = True
+
+        formatted = text if text.endswith("\n") else text + "\n"
+        chunks.append(formatted)
+        self.thinking_buf.append(formatted)
+        return {"kind": "thinking", "content": "".join(chunks)}
+
 
 __all__ = [
     "build_console_input",
@@ -879,6 +1059,8 @@ __all__ = [
     "inject_web_search_tool",
     "extract_console_text",
     "extract_console_reasoning",
+    "format_console_reasoning",
+    "inject_console_reasoning_output",
     "extract_console_tool_calls",
     "extract_console_annotations",
     "extract_console_search_sources",

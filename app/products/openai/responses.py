@@ -24,6 +24,7 @@ from app.dataplane.reverse.protocol.xai_console import (
     convert_openai_tools_to_console,
     extract_console_sse_error,
     extract_console_usage,
+    inject_console_reasoning_output,
     inject_web_search_tool,
 )
 from app.products._account_selection import reserve_account, selection_max_retries
@@ -250,6 +251,7 @@ async def _console_responses_dispatch(
     model: str,
     messages: list[dict],
     stream: bool,
+    emit_think: bool,
     temperature: float,
     top_p: float,
     reasoning_effort: str | None,
@@ -505,7 +507,7 @@ async def _console_responses_dispatch(
         response_json.get("status"),
         extract_console_usage(response_json),
     )
-    return response_json
+    return inject_console_reasoning_output(response_json) if emit_think else response_json
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +554,7 @@ async def create(
             model=model,
             messages=messages,
             stream=stream,
+            emit_think=emit_think,
             temperature=temperature,
             top_p=top_p,
             reasoning_effort=reasoning_effort,

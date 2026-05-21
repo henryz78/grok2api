@@ -143,6 +143,66 @@ class ConsoleProtocolRegressionTests(unittest.TestCase):
             },
         )
 
+    def test_format_console_reasoning_synthesizes_tool_trace_when_summary_missing(self):
+        response = {
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "action": {
+                        "type": "search",
+                        "query": "Donald Trump recent activities May 2026",
+                        "sources": [{"url": "https://example.com", "title": "Example"}],
+                    },
+                },
+                {
+                    "type": "x_search_call",
+                    "action": {
+                        "type": "search",
+                        "query": "Trump OR 特朗普 since:2026-05-01",
+                    },
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup_account",
+                    "arguments": "{\"query\":\"account status\"}",
+                },
+            ]
+        }
+
+        self.assertEqual(
+            self.xai_console.format_console_reasoning(response),
+            "Thinking about your request\n"
+            "🔍 web_search: Donald Trump recent activities May 2026\n"
+            "🔍 x_search: Trump OR 特朗普 since:2026-05-01\n"
+            "🔧 lookup_account: account status\n",
+        )
+
+    def test_console_stream_adapter_emits_synthetic_search_reasoning(self):
+        adapter = self.xai_console.ConsoleStreamAdapter()
+        adapter.feed_event("response.output_item.done")
+
+        event = adapter.feed_data(
+            json.dumps(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "web_search_call",
+                        "action": {
+                            "type": "search",
+                            "query": "特朗普 最近行程 2026",
+                        },
+                    },
+                }
+            )
+        )
+
+        self.assertEqual(event["kind"], "thinking")
+        self.assertEqual(
+            event["content"],
+            "Thinking about your request\n🔍 web_search: 特朗普 最近行程 2026\n",
+        )
+
 
 class ConsoleReasoningDefaultsTests(unittest.TestCase):
     @classmethod
