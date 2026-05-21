@@ -152,29 +152,41 @@ class ConsoleReasoningDefaultsTests(unittest.TestCase):
 
     def test_hybrid_console_models_default_to_high_reasoning_effort(self):
         self.assertEqual(
-            self.registry.resolve("grok-4.3").default_reasoning_effort,
+            self.registry.resolve("c/grok-4.3").default_reasoning_effort,
             "high",
         )
         self.assertEqual(
-            self.registry.resolve("grok-4").default_reasoning_effort,
-            "high",
-        )
-        self.assertEqual(
-            self.registry.resolve("grok-4.20").default_reasoning_effort,
-            "high",
-        )
-        self.assertEqual(
-            self.registry.resolve("grok-4.20-reasoning").default_reasoning_effort,
+            self.registry.resolve("c/grok-4.20-reasoning").default_reasoning_effort,
             "",
         )
         self.assertEqual(
-            self.registry.resolve("grok-4.20-non-reasoning").default_reasoning_effort,
+            self.registry.resolve("c/grok-4.20-non-reasoning").default_reasoning_effort,
             "",
         )
         self.assertEqual(
-            self.registry.resolve("grok-4.20-multi-agent").default_reasoning_effort,
+            self.registry.resolve("c/grok-4.20-multi-agent").default_reasoning_effort,
             "",
         )
+
+    def test_console_aliases_resolve_to_canonical_c_prefixed_models(self):
+        self.assertEqual(
+            self.registry.resolve("grok-4.3").model_name,
+            "c/grok-4.3",
+        )
+        self.assertEqual(
+            self.registry.resolve("grok-4.20-reasoning").model_name,
+            "c/grok-4.20-reasoning",
+        )
+        self.assertEqual(
+            self.registry.resolve("grok-4.20-non-reasoning").model_name,
+            "c/grok-4.20-non-reasoning",
+        )
+        self.assertEqual(
+            self.registry.resolve("grok-4.20-multi-agent").model_name,
+            "c/grok-4.20-multi-agent",
+        )
+        with self.assertRaises(ValueError):
+            self.registry.resolve("grok-4.20")
 
 
 class AnthropicConsoleBridgeRegressionTests(unittest.TestCase):

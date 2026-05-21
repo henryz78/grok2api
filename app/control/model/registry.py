@@ -37,14 +37,12 @@ MODELS: tuple[ModelSpec, ...] = (
     ModelSpec("grok-4.3-beta",                          ModeId.GROK_4_3, Tier.SUPER, Capability.CHAT,       True, "Grok 4.3 Beta"),
 
     # === Console API (console.x.ai/v1/responses) ============================
-    # 通过 SSO cookie 直接调用 console.x.ai，basic 账号即可使用所有模型
-    # 速率限制由 console.x.ai 控制（免费 tier: 1 rps / 60 RPM）
-    ModelSpec("grok-4.3",                               ModeId.FAST, Tier.BASIC, Capability.CHAT,           True, "Grok 4.3 (Console)",                    console_model="grok-4.3",                       default_reasoning_effort="high"),
-    ModelSpec("grok-4",                                 ModeId.FAST, Tier.BASIC, Capability.CHAT,           True, "Grok 4 (Console)",                      console_model="grok-4",                         default_reasoning_effort="high"),
-    ModelSpec("grok-4.20",                              ModeId.FAST, Tier.BASIC, Capability.CHAT,           True, "Grok 4.20 (Console)",                   console_model="grok-4.20",                      default_reasoning_effort="high"),
-    ModelSpec("grok-4.20-reasoning",                    ModeId.FAST, Tier.BASIC, Capability.CHAT,           True, "Grok 4.20 Reasoning (Console)",         console_model="grok-4.20-0309-reasoning"),
-    ModelSpec("grok-4.20-non-reasoning",                ModeId.FAST, Tier.BASIC, Capability.CHAT,           True, "Grok 4.20 Non-Reasoning (Console)",     console_model="grok-4.20-0309-non-reasoning"),
-    ModelSpec("grok-4.20-multi-agent",                  ModeId.FAST, Tier.BASIC, Capability.CHAT,           True, "Grok 4.20 Multi-Agent (Console)",       console_model="grok-4.20-multi-agent-0309"),
+    # 通过 SSO cookie 直接调用 console.x.ai，basic 账号即可使用这组确认可用的模型。
+    # 对外统一加上 c/ 前缀，和官方 grok.com / imagine 路由彻底分开。
+    ModelSpec("c/grok-4.3",                             ModeId.FAST, Tier.BASIC, Capability.CHAT,           True, "c/Grok 4.3",                            console_model="grok-4.3",                       default_reasoning_effort="high"),
+    ModelSpec("c/grok-4.20-reasoning",                  ModeId.FAST, Tier.BASIC, Capability.CHAT,           True, "c/Grok 4.20 Reasoning",                 console_model="grok-4.20-0309-reasoning"),
+    ModelSpec("c/grok-4.20-non-reasoning",              ModeId.FAST, Tier.BASIC, Capability.CHAT,           True, "c/Grok 4.20 Non-Reasoning",             console_model="grok-4.20-0309-non-reasoning"),
+    ModelSpec("c/grok-4.20-multi-agent",                ModeId.FAST, Tier.BASIC, Capability.CHAT,           True, "c/Grok 4.20 Multi-Agent",               console_model="grok-4.20-multi-agent-0309"),
 
     # === Image ==============================================================
 
@@ -71,6 +69,12 @@ MODELS: tuple[ModelSpec, ...] = (
 # ---------------------------------------------------------------------------
 
 _BY_NAME: dict[str, ModelSpec] = {m.model_name: m for m in MODELS}
+_ALIASES: dict[str, str] = {
+    "grok-4.3": "c/grok-4.3",
+    "grok-4.20-reasoning": "c/grok-4.20-reasoning",
+    "grok-4.20-non-reasoning": "c/grok-4.20-non-reasoning",
+    "grok-4.20-multi-agent": "c/grok-4.20-multi-agent",
+}
 
 _BY_CAP: dict[int, list[ModelSpec]] = {}
 for _m in MODELS:
@@ -83,12 +87,16 @@ for _m in MODELS:
 
 def get(model_name: str) -> ModelSpec | None:
     """Return the spec for *model_name*, or ``None`` if not registered."""
-    return _BY_NAME.get(model_name)
+    spec = _BY_NAME.get(model_name)
+    if spec is not None:
+        return spec
+    alias = _ALIASES.get(model_name)
+    return _BY_NAME.get(alias) if alias else None
 
 
 def resolve(model_name: str) -> ModelSpec:
     """Return the spec for *model_name*; raise ``ValueError`` if unknown."""
-    spec = _BY_NAME.get(model_name)
+    spec = get(model_name)
     if spec is None:
         raise ValueError(f"Unknown model: {model_name!r}")
     return spec

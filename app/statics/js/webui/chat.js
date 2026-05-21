@@ -54,9 +54,11 @@
   }
 
   function formatModelOptionLabel(modelId, fallbackName) {
-    const normalized = String(modelId || '').trim().toLowerCase();
-    if (!normalized) return fallbackName || '';
+    const rawId = String(modelId || '').trim();
+    if (!rawId) return fallbackName || '';
+    if (rawId.startsWith('c/')) return rawId;
 
+    const normalized = rawId.toLowerCase();
     return normalized
       .split('-')
       .filter(Boolean)

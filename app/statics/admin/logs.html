@@ -30,9 +30,12 @@
     .table-card {
       background:#fff;
       border-radius:14px;
-      overflow:hidden;
+      overflow-x:auto;
+      overflow-y:hidden;
+      -webkit-overflow-scrolling:touch;
       box-shadow:none;
     }
+    .table-card > table { width:max-content; min-width:100%; border-collapse:collapse }
     table { width:100%; border-collapse:collapse }
     th, td { padding:12px 14px; border-bottom:1px solid #f3f3f3; vertical-align:top; text-align:left }
     th { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:#8a8a8a; font-weight:700 }
