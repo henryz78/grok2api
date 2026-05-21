@@ -564,8 +564,18 @@ window.renderAdminHeader = async function renderAdminHeader() {
 
   try {
     const cachedHtml = window.__grok2apiAdminHeaderHtml || readSessionCache(HEADER_HTML_CACHE_KEY);
+    const cacheMissingLogs = cachedHtml && !cachedHtml.includes('data-nav="/admin/logs"');
     if (cachedHtml) {
-      mount.innerHTML = cachedHtml;
+      if (!cacheMissingLogs) {
+        mount.innerHTML = cachedHtml;
+      } else {
+        const res = await fetch('/static/admin/header.html');
+        if (!res.ok) throw new Error('header unavailable');
+        const html = await res.text();
+        mount.innerHTML = html;
+        window.__grok2apiAdminHeaderHtml = html;
+        writeSessionCache(HEADER_HTML_CACHE_KEY, html);
+      }
     } else {
       const res = await fetch('/static/admin/header.html');
       if (!res.ok) throw new Error('header unavailable');
