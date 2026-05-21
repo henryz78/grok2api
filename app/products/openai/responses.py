@@ -252,6 +252,7 @@ async def _console_responses_dispatch(
     stream: bool,
     temperature: float,
     top_p: float,
+    reasoning_effort: str | None,
     tools: list[dict] | None,
     tool_choice: Any,
 ) -> dict | AsyncGenerator[str, None]:
@@ -262,6 +263,9 @@ async def _console_responses_dispatch(
     of event/data block boundaries) and for non-streaming we return the
     upstream JSON object as-is.
     """
+    if reasoning_effort is None and spec.default_reasoning_effort:
+        reasoning_effort = spec.default_reasoning_effort
+
     cfg = get_config()
     console_model = spec.console_model
 
@@ -320,6 +324,7 @@ async def _console_responses_dispatch(
                             stream=True,
                             temperature=temperature,
                             top_p=top_p,
+                            reasoning_effort=reasoning_effort,
                             tools=console_tools,
                             tool_choice=console_tool_choice,
                             timeout_s=timeout_s,
@@ -431,6 +436,7 @@ async def _console_responses_dispatch(
                     stream=False,
                     temperature=temperature,
                     top_p=top_p,
+                    reasoning_effort=reasoning_effort,
                     tools=console_tools,
                     tool_choice=console_tool_choice,
                     timeout_s=timeout_s,
@@ -516,6 +522,7 @@ async def create(
     emit_think: bool,
     temperature: float,
     top_p: float,
+    reasoning_effort: str | None = None,
     tools: list[dict] | None = None,
     tool_choice: Any = None,
 ) -> dict | AsyncGenerator[str, None]:
@@ -547,6 +554,7 @@ async def create(
             stream=stream,
             temperature=temperature,
             top_p=top_p,
+            reasoning_effort=reasoning_effort,
             tools=tools,
             tool_choice=tool_choice,
         )

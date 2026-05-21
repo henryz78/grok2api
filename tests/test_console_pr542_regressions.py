@@ -144,6 +144,39 @@ class ConsoleProtocolRegressionTests(unittest.TestCase):
         )
 
 
+class ConsoleReasoningDefaultsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        _install_common_stubs()
+        cls.registry = importlib.import_module("app.control.model.registry")
+
+    def test_hybrid_console_models_default_to_high_reasoning_effort(self):
+        self.assertEqual(
+            self.registry.resolve("grok-4.3").default_reasoning_effort,
+            "high",
+        )
+        self.assertEqual(
+            self.registry.resolve("grok-4").default_reasoning_effort,
+            "high",
+        )
+        self.assertEqual(
+            self.registry.resolve("grok-4.20").default_reasoning_effort,
+            "high",
+        )
+        self.assertEqual(
+            self.registry.resolve("grok-4.20-reasoning").default_reasoning_effort,
+            "",
+        )
+        self.assertEqual(
+            self.registry.resolve("grok-4.20-non-reasoning").default_reasoning_effort,
+            "",
+        )
+        self.assertEqual(
+            self.registry.resolve("grok-4.20-multi-agent").default_reasoning_effort,
+            "",
+        )
+
+
 class AnthropicConsoleBridgeRegressionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

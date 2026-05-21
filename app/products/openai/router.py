@@ -309,6 +309,7 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
                 tool_choice=req.tool_choice,
                 temperature=req.temperature or 0.8,
                 top_p=req.top_p or 0.95,
+                reasoning_effort=req.reasoning_effort,
             )
 
     except AppError:
@@ -395,9 +396,15 @@ async def responses_endpoint(req: ResponsesCreateRequest):
 
     # Map reasoning param → emit_think flag.
     # reasoning=None → use config; reasoning.effort="none" → off; otherwise on.
+    reasoning_effort: str | None = None
+    if isinstance(req.reasoning, dict):
+        eff = req.reasoning.get("effort")
+        if isinstance(eff, str):
+            reasoning_effort = eff
+
     if req.reasoning is None:
         emit_think = cfg.get_bool("features.thinking", True)
-    elif isinstance(req.reasoning, dict) and req.reasoning.get("effort") == "none":
+    elif reasoning_effort == "none":
         emit_think = False
     else:
         emit_think = True
@@ -412,6 +419,7 @@ async def responses_endpoint(req: ResponsesCreateRequest):
         emit_think=emit_think,
         temperature=req.temperature or 0.8,
         top_p=req.top_p or 0.95,
+        reasoning_effort=reasoning_effort,
         tools=req.tools or None,
         tool_choice=req.tool_choice,
     )

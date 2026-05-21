@@ -455,6 +455,7 @@ async def _console_post(
     tools: list[dict] | None,
     tool_choice: Any,
     timeout_s: float,
+    reasoning_effort: str | None = None,
 ) -> Any:
     """POST to console.x.ai/v1/responses; return ``(session, response)``.
 
@@ -473,6 +474,7 @@ async def _console_post(
         stream=stream,
         temperature=temperature,
         top_p=top_p,
+        reasoning_effort=reasoning_effort,
         tools=tools,
         tool_choice=tool_choice,
     )
@@ -541,6 +543,7 @@ async def _console_completions(
     emit_think: bool,
     temperature: float = 0.8,
     top_p: float = 0.95,
+    reasoning_effort: str | None = None,
     tools: list[dict] | None = None,
     tool_choice: Any = None,
 ) -> dict | AsyncGenerator[str, None]:
@@ -556,6 +559,9 @@ async def _console_completions(
       - SSE streaming for both text and tool call arguments
       - URL citation annotations from upstream search results
     """
+    if reasoning_effort is None and spec.default_reasoning_effort:
+        reasoning_effort = spec.default_reasoning_effort
+
     cfg = get_config()
     console_model = spec.console_model
 
@@ -623,6 +629,7 @@ async def _console_completions(
                             stream=True,
                             temperature=temperature,
                             top_p=top_p,
+                            reasoning_effort=reasoning_effort,
                             tools=console_tools,
                             tool_choice=console_tool_choice,
                             timeout_s=timeout_s,
@@ -791,6 +798,7 @@ async def _console_completions(
                     stream=False,
                     temperature=temperature,
                     top_p=top_p,
+                    reasoning_effort=reasoning_effort,
                     tools=console_tools,
                     tool_choice=console_tool_choice,
                     timeout_s=timeout_s,
@@ -921,6 +929,7 @@ async def completions(
     tool_choice: Any = None,
     temperature: float = 0.8,
     top_p: float = 0.95,
+    reasoning_effort: str | None = None,
     request_overrides: dict | None = None,
 ) -> dict | AsyncGenerator[str, None]:
     """Entry point for /v1/chat/completions.
@@ -956,6 +965,7 @@ async def completions(
             emit_think=emit_think,
             temperature=temperature,
             top_p=top_p,
+            reasoning_effort=reasoning_effort,
             tools=tools,
             tool_choice=tool_choice,
         )
