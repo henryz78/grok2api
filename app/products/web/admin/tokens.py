@@ -106,9 +106,9 @@ class SaveTokensRequest(RootModel[dict[str, list[str | TokenImportItem]]]):
 # ---------------------------------------------------------------------------
 
 def _quota_brief(q: dict) -> dict:
-    """Extract {auto, fast, expert, heavy} with only remaining/total from stored quota dict."""
+    """Extract mode windows with only remaining/total from stored quota dict."""
     out = {}
-    for mode in ("auto", "fast", "expert", "heavy"):
+    for mode in ("auto", "fast", "expert", "heavy", "grok_4_3"):
         v = q.get(mode)
         if isinstance(v, dict):
             out[mode] = {
@@ -125,8 +125,14 @@ def _serialize_record(r) -> dict:
         "status":      r.status,
         "quota":       _quota_brief(r.quota) if isinstance(r.quota, dict) else {},
         "use_count":   r.usage_use_count or 0,
+        "fail_count":  r.usage_fail_count or 0,
+        "sync_count":  r.usage_sync_count or 0,
         "last_used_at": r.last_use_at,
+        "last_fail_at": r.last_fail_at,
+        "last_fail_reason": r.last_fail_reason,
+        "state_reason": r.state_reason,
         "tags":        r.tags or [],
+        "ext":         r.ext or {},
     }
 
 

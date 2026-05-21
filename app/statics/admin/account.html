@@ -75,6 +75,25 @@
       background:#222;
       border-color:#222;
     }
+    .layer-tabs {
+      display:flex;
+      align-items:center;
+      gap:6px;
+      flex-wrap:wrap;
+    }
+    .layer-tab {
+      height:30px;
+      padding:0 12px;
+      border-radius:999px;
+      font-size:12px;
+      font-weight:600;
+      color:#8f8f8f;
+      background:#f5f5f5;
+      transition:background .15s, color .15s;
+      cursor:pointer;
+    }
+    .layer-tab:hover { color:#555; background:#f1f1f1 }
+    .layer-tab.active { background:#111; color:#fff }
 
     /* Stats */
     .stat-grid {
@@ -139,6 +158,8 @@
     .stat-grid.mode-random [data-stat-card="calls"] { order:6 }
     .stat-grid.mode-random [data-stat-card="success"] { order:7 }
     .stat-grid.mode-random [data-stat-card="rate"] { order:8 }
+    .layer-panel { display:none }
+    .layer-panel.active { display:block }
 
     /* Filters */
     .filter-bar {
@@ -737,9 +758,14 @@
 
   <div class="section-head">
     <div class="section-title" data-i18n="account.sectionOverview">账户概览</div>
+    <div class="layer-tabs">
+      <button type="button" class="layer-tab active" data-layer-tab="chat" onclick="switchLayer('chat')">对话路由</button>
+      <button type="button" class="layer-tab" data-layer-tab="media" onclick="switchLayer('media')">媒体路由</button>
+    </div>
   </div>
 
   <!-- Stats -->
+  <div class="layer-panel active" id="layer-panel-chat">
   <div class="stat-grid" id="overview-stats">
     <div class="stat-cell" data-stat-card="total">
       <div class="stat-top">
@@ -848,6 +874,66 @@
         </span>
       </div>
       <div class="stat-num" id="s-qh" style="color:#b0632a">0</div>
+    </div>
+  </div>
+  </div>
+
+  <div class="layer-panel" id="layer-panel-media">
+    <div class="stat-grid" id="overview-stats-media" style="grid-template-columns:repeat(6, minmax(0, 1fr));">
+      <div class="stat-cell">
+        <div class="stat-top">
+          <div class="stat-label">图片成功</div>
+          <span class="stat-icon" style="color:#2563eb">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="m8 13 2-2 4 4 2-2 2 2"/><circle cx="9" cy="9" r="1.2"/></svg>
+          </span>
+        </div>
+        <div class="stat-num" id="m-image-ok" style="color:#2563eb">0</div>
+      </div>
+      <div class="stat-cell">
+        <div class="stat-top">
+          <div class="stat-label">图片失败</div>
+          <span class="stat-icon" style="color:#dc2626">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="m9 9 6 6"/><path d="m15 9-6 6"/></svg>
+          </span>
+        </div>
+        <div class="stat-num" id="m-image-fail" style="color:#dc2626">0</div>
+      </div>
+      <div class="stat-cell">
+        <div class="stat-top">
+          <div class="stat-label">视频成功</div>
+          <span class="stat-icon" style="color:#16a34a">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><rect x="4" y="5" width="12" height="14" rx="2"/><path d="m16 10 4-2v8l-4-2z"/></svg>
+          </span>
+        </div>
+        <div class="stat-num" id="m-video-ok" style="color:#16a34a">0</div>
+      </div>
+      <div class="stat-cell">
+        <div class="stat-top">
+          <div class="stat-label">视频失败</div>
+          <span class="stat-icon" style="color:#c2410c">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><rect x="4" y="5" width="12" height="14" rx="2"/><path d="m16 10 4-2v8l-4-2z"/><path d="m8 9 4 6"/><path d="m12 9-4 6"/></svg>
+          </span>
+        </div>
+        <div class="stat-num" id="m-video-fail" style="color:#c2410c">0</div>
+      </div>
+      <div class="stat-cell">
+        <div class="stat-top">
+          <div class="stat-label">最近媒体调用</div>
+          <span class="stat-icon" style="color:#111">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M12 6v6l4 2"/><circle cx="12" cy="12" r="8"/></svg>
+          </span>
+        </div>
+        <div class="stat-num" id="m-last-at" style="font-size:15px;color:#111">—</div>
+      </div>
+      <div class="stat-cell">
+        <div class="stat-top">
+          <div class="stat-label">最近媒体错误</div>
+          <span class="stat-icon" style="color:#dc2626">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><circle cx="12" cy="12" r="8"/><path d="M12 8v5"/><circle cx="12" cy="16" r="1"/></svg>
+          </span>
+        </div>
+        <div class="stat-num" id="m-last-error" style="font-size:14px;color:#dc2626;line-height:1.25">—</div>
+      </div>
     </div>
   </div>
 
@@ -971,7 +1057,7 @@
           <th style="width:200px" data-i18n="account.colToken">Token</th>
           <th class="table-center" style="width:70px" data-i18n="account.colType">类型</th>
           <th class="table-center" style="width:70px" data-i18n="account.colStatus">状态</th>
-          <th data-quota-only>
+          <th data-layer="chat" data-quota-only>
             <span data-i18n="account.colQuota">额度</span>
             <span style="margin-left:6px;display:inline-flex;align-items:center;gap:3px;vertical-align:middle">
               <span class="q-pill q-a">A</span>
@@ -980,10 +1066,17 @@
               <span class="q-pill q-h">H</span>
             </span>
           </th>
-          <th class="table-center" data-i18n="account.colSuccess">成功</th>
-          <th class="table-center" data-i18n="account.colFail">失败</th>
-          <th class="table-center" data-i18n="account.colRate">成功率</th>
-          <th data-i18n="account.colLastUsed">最近使用</th>
+          <th class="table-center" data-layer="chat" data-i18n="account.colSuccess">成功</th>
+          <th class="table-center" data-layer="chat" data-i18n="account.colFail">失败</th>
+          <th class="table-center" data-layer="chat" data-i18n="account.colRate">成功率</th>
+          <th data-layer="chat" data-i18n="account.colLastUsed">最近使用</th>
+          <th data-layer="chat">最近失败</th>
+          <th class="table-center" data-layer="media">图成</th>
+          <th class="table-center" data-layer="media">图失</th>
+          <th class="table-center" data-layer="media">视成</th>
+          <th class="table-center" data-layer="media">视失</th>
+          <th data-layer="media">最近媒体</th>
+          <th data-layer="media">最近错误</th>
           <th data-i18n="account.colActions">操作</th>
         </tr>
       </thead>
@@ -1095,6 +1188,7 @@ const PAGE_SIZE_KEY = 'admin.account.page_size';
 const PAGE_SIZE_OPTIONS = [50, 100, 200, 500, 1000, 2000];
 
 let allTokens = [], curStatus = 'all', curNsfw = 'all', curPool = 'all', curPage = 1, pageSize = loadSavedPageSize();
+let curLayer = 'chat';
 const sel = new Set();
 const refreshingTokens = new Set();
 let _cb = null;
@@ -1207,13 +1301,32 @@ function applyStrategyUI() {
   });
 }
 
+function applyLayerUI() {
+  document.querySelectorAll('[data-layer-tab]').forEach((el) => {
+    el.classList.toggle('active', el.dataset.layerTab === curLayer);
+  });
+  document.querySelectorAll('.layer-panel').forEach((el) => {
+    el.classList.toggle('active', el.id === `layer-panel-${curLayer}`);
+  });
+  document.querySelectorAll('[data-layer]').forEach((el) => {
+    el.style.display = el.dataset.layer === curLayer ? '' : 'none';
+  });
+  if (curLayer !== 'chat') {
+    document.querySelectorAll('[data-quota-only]').forEach((el) => {
+      el.style.display = 'none';
+    });
+  } else {
+    applyStrategyUI();
+  }
+}
+
 // ── Render ─────────────────────────────────────────────────────────────────
 function render() {
   const view = getTokenView();
   renderStats(view);
   renderFilters(view);
   renderTable(view);
-  applyStrategyUI();
+  applyLayerUI();
 }
 
 function getTokenView() {
@@ -1232,6 +1345,15 @@ function getTokenView() {
     qf: 0,
     qe: 0,
     qh: 0,
+  };
+  const mediaStats = {
+    imageOk: 0,
+    imageFail: 0,
+    videoOk: 0,
+    videoFail: 0,
+    lastAt: 0,
+    lastErrorAt: 0,
+    lastErrorMessage: '',
   };
   const statusCounts = { all: 0, active: 0, cooling: 0, invalid: 0, disabled: 0 };
   const nsfwCounts = { all: 0, enabled: 0, disabled: 0 };
@@ -1253,6 +1375,7 @@ function getTokenView() {
     poolsSet.add(pool);
     const successCount = token.use_count || 0;
     const failCount = token.fail_count || 0;
+    const ext = token.ext && typeof token.ext === 'object' ? token.ext : {};
     stats.success += successCount;
     stats.fail += failCount;
     stats.calls += successCount + failCount;
@@ -1260,6 +1383,15 @@ function getTokenView() {
     stats.qf += quota.fast?.remaining || 0;
     stats.qe += quota.expert?.remaining || 0;
     stats.qh += quota.heavy?.remaining || 0;
+    mediaStats.imageOk += toNum(ext.image_ok);
+    mediaStats.imageFail += toNum(ext.image_fail);
+    mediaStats.videoOk += toNum(ext.video_ok);
+    mediaStats.videoFail += toNum(ext.video_fail);
+    if (toNum(ext.last_media_at) > mediaStats.lastAt) mediaStats.lastAt = toNum(ext.last_media_at);
+    if (toNum(ext.last_media_error_at) >= mediaStats.lastErrorAt) {
+      mediaStats.lastErrorAt = toNum(ext.last_media_error_at);
+      mediaStats.lastErrorMessage = mediaErrorText(token);
+    }
 
     if (token.status === 'active') stats.active += 1;
     if (token.status === 'cooling') stats.cooling += 1;
@@ -1296,6 +1428,7 @@ function getTokenView() {
   _tokenViewCacheKey = `${_tokenViewVersion}|${curStatus}|${curNsfw}|${curPool}`;
   _tokenViewCache = {
     stats,
+    mediaStats,
     statusCounts,
     nsfwCounts,
     poolCounts,
@@ -1328,6 +1461,13 @@ function renderStats(view = getTokenView()) {
   $('s-success', fmt(stats.success));
   $('s-rate', fmtRate(stats.success, stats.fail));
   $('s-qa', fmt(stats.qa)); $('s-qf', fmt(stats.qf)); $('s-qe', fmt(stats.qe)); $('s-qh', fmt(stats.qh));
+  const media = view.mediaStats || {};
+  $('m-image-ok', fmt(media.imageOk || 0));
+  $('m-image-fail', fmt(media.imageFail || 0));
+  $('m-video-ok', fmt(media.videoOk || 0));
+  $('m-video-fail', fmt(media.videoFail || 0));
+  $('m-last-at', fmtDate(media.lastAt || null));
+  $('m-last-error', shortText(media.lastErrorMessage || tr('account.na', null, '—'), 56));
 }
 
 function renderFilters(view = getTokenView()) {
@@ -1448,7 +1588,7 @@ function renderTable(view = getTokenView()) {
 
   document.getElementById('tbody').innerHTML = slice.length
     ? slice.map(rowHtml).join('')
-    : `<tr><td colspan="10" class="empty-state">${tr('account.empty', null, '暂无 Token，请点击右上角导入或添加。')}</td></tr>`;
+    : `<tr><td colspan="20" class="empty-state">${tr('account.empty', null, '暂无 Token，请点击右上角导入或添加。')}</td></tr>`;
 
   $('pagi-page', tr('account.pageIndicator', { current: total ? curPage : 0, total: pages }, `第 ${total ? curPage : 0} / ${pages} 页`));
   $('section-table-count', total);
@@ -1459,11 +1599,16 @@ function renderTable(view = getTokenView()) {
 
 function rowHtml(t) {
   const q      = t.quota || {};
+  const ext    = t.ext && typeof t.ext === 'object' ? t.ext : {};
   const isNsfw = (t.tags || []).includes('nsfw');
   const isDisabled = t.status === 'disabled';
   const isRefreshing = refreshingTokens.has(t.token);
   const success = t.use_count || 0;
   const fail = t.fail_count || 0;
+  const imageOk = toNum(ext.image_ok);
+  const imageFail = toNum(ext.image_fail);
+  const videoOk = toNum(ext.video_ok);
+  const videoFail = toNum(ext.video_fail);
   const nsfwBtn = isNsfw
     ? `<button type="button" class="row-nsfw-btn is-on" data-nsfw-token="${xe(t.token)}" data-nsfw-enabled="false" data-tip="${xe(tr('account.batchNsfwDisable', null, '关闭 NSFW'))}" aria-label="${xe(tr('account.batchNsfwDisable', null, '关闭 NSFW'))}">
         <svg viewBox="0 0 20 20" aria-hidden="true">
@@ -1488,11 +1633,18 @@ function rowHtml(t) {
       </div></td>
     <td class="table-center"><span class="badge badge-${t.pool||'basic'}">${xe(poolLabel(t.pool || 'basic'))}</span></td>
     <td class="table-center">${statusBadge(t.status)}</td>
-    <td data-quota-only><div class="quota-cell">${qpills(q)}</div></td>
-    <td class="table-center" style="font-variant-numeric:tabular-nums;color:#8f8f8f">${success}</td>
-    <td class="table-center" style="font-variant-numeric:tabular-nums;color:#9a9a9a">${fail}</td>
-    <td class="table-center" style="font-variant-numeric:tabular-nums;color:#9a9a9a">${fmtRate(success, fail)}</td>
-    <td style="font-size:12px;color:#9a9a9a">${fmtDate(t.last_used_at)}</td>
+    <td data-layer="chat" data-quota-only><div class="quota-cell">${qpills(q)}</div></td>
+    <td data-layer="chat" class="table-center" style="font-variant-numeric:tabular-nums;color:#8f8f8f">${success}</td>
+    <td data-layer="chat" class="table-center" style="font-variant-numeric:tabular-nums;color:#9a9a9a">${fail}</td>
+    <td data-layer="chat" class="table-center" style="font-variant-numeric:tabular-nums;color:#9a9a9a">${fmtRate(success, fail)}</td>
+    <td data-layer="chat" style="font-size:12px;color:#9a9a9a">${fmtDate(t.last_used_at)}</td>
+    <td data-layer="chat" style="font-size:12px;color:#9a9a9a">${h(shortText(lastFailText(t), 56))}</td>
+    <td data-layer="media" class="table-center" style="font-variant-numeric:tabular-nums;color:#2563eb">${imageOk}</td>
+    <td data-layer="media" class="table-center" style="font-variant-numeric:tabular-nums;color:#dc2626">${imageFail}</td>
+    <td data-layer="media" class="table-center" style="font-variant-numeric:tabular-nums;color:#16a34a">${videoOk}</td>
+    <td data-layer="media" class="table-center" style="font-variant-numeric:tabular-nums;color:#c2410c">${videoFail}</td>
+    <td data-layer="media" style="font-size:12px;color:#9a9a9a">${fmtDate(ext.last_media_at || null)}</td>
+    <td data-layer="media" style="font-size:12px;color:#9a9a9a">${h(shortText(mediaErrorText(t), 64))}</td>
     <td><div class="row-actions">
       ${nsfwBtn}
       <button onclick="${isDisabled ? `restoreOne('${xe(t.token)}')` : `disableOne('${xe(t.token)}')`}" class="row-icon-btn row-icon-btn-state" data-tip="${xe(isDisabled ? tr('account.actionRestore', null, '恢复账号') : tr('account.actionDisable', null, '禁用账号'))}" aria-label="${xe(isDisabled ? tr('account.actionRestore', null, '恢复账号') : tr('account.actionDisable', null, '禁用账号'))}">
@@ -1560,6 +1712,10 @@ function switchPool(pool) {
     renderTable();
   });
 }
+function switchLayer(layer) {
+  curLayer = layer === 'media' ? 'media' : 'chat';
+  applyLayerUI();
+}
 function prevPage() { if (curPage > 1) { curPage--; renderTable(); } }
 function nextPage() {
   const pages = Math.max(1, Math.ceil(getTokenView().filteredItems.length / pageSize));
@@ -1595,6 +1751,10 @@ function updateBatchBtns() {
 // ── Helpers ────────────────────────────────────────────────────────────────
 function $(id, v) { const el = document.getElementById(id); if (el) el.textContent = v; }
 function fmt(n) { return n >= 10000 ? (n/1000).toFixed(1)+'k' : n; }
+function toNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
 function loadSavedPageSize() {
   const raw = Number(localStorage.getItem(PAGE_SIZE_KEY) || 0);
   return PAGE_SIZE_OPTIONS.includes(raw) ? raw : 50;
@@ -1606,12 +1766,34 @@ function fmtRate(success, fail) {
 }
 function mask(t) { return t.length > 20 ? t.slice(0,8) + '…' + t.slice(-8) : t; }
 function xe(s) { return s.replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'&quot;'); }
+function h(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+function shortText(value, limit = 64) {
+  const text = String(value || '').trim();
+  if (!text) return tr('account.na', null, '—');
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
 function fmtDate(d) {
   if (!d) return tr('account.na', null, '—');
   const dt = new Date(typeof d === 'number' ? d : d);
   return isNaN(dt)
     ? tr('account.na', null, '—')
     : dt.toLocaleDateString(I18n.getLang() === 'en' ? 'en-US' : 'zh-CN', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+}
+function lastFailText(t) {
+  return t.last_fail_reason || t.state_reason || tr('account.na', null, '—');
+}
+function mediaErrorText(t) {
+  const ext = t.ext && typeof t.ext === 'object' ? t.ext : {};
+  const status = ext.last_media_error_status ? `[${ext.last_media_error_status}] ` : '';
+  const route = ext.last_media_error_route ? `${ext.last_media_error_route}: ` : '';
+  return `${status}${route}${ext.last_media_error_message || ''}`.trim() || tr('account.na', null, '—');
 }
 function statusBadge(s) {
   const m = {

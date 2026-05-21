@@ -29,6 +29,7 @@ from app.platform.logging.logger import logger
 from app.platform.runtime.clock import now_s
 from app.platform.storage import save_local_video
 from app.control.account.enums import FeedbackKind
+from app.control.account.activity import record_media_activity
 from app.control.model import registry as model_registry
 from app.control.model.registry import resolve as resolve_model
 from app.dataplane.proxy import get_proxy_runtime
@@ -52,7 +53,7 @@ from ._format import (
     make_stream_chunk,
     make_thinking_chunk,
 )
-from .chat import _fail_sync, _quota_sync, _feedback_kind
+from .chat import _fail_sync, _quota_sync, _feedback_kind, _log_task_exception
 
 _IMAGE_MEDIA_TYPE = "MEDIA_POST_TYPE_IMAGE"
 _VIDEO_MEDIA_TYPE = "MEDIA_POST_TYPE_VIDEO"
@@ -788,9 +789,26 @@ async def _run_video_with_account(
         )
         await _acct_dir.feedback(token, kind, int(spec.mode_id))
         if success:
-            asyncio.create_task(_quota_sync(token, int(spec.mode_id)))
+            asyncio.create_task(
+                _quota_sync(
+                    token,
+                    int(spec.mode_id),
+                    capability="video",
+                    route="videos.generate",
+                    model=spec.model_name,
+                )
+            ).add_done_callback(_log_task_exception)
         else:
-            asyncio.create_task(_fail_sync(token, int(spec.mode_id), fail_exc))
+            asyncio.create_task(
+                _fail_sync(
+                    token,
+                    int(spec.mode_id),
+                    fail_exc,
+                    capability="video",
+                    route="videos.generate",
+                    model=spec.model_name,
+                )
+            ).add_done_callback(_log_task_exception)
 
 
 async def _put_video_job(job: _VideoJob) -> None:
@@ -894,9 +912,26 @@ async def _run_video_job(
             )
             await _acct_dir.feedback(token, kind, int(spec.mode_id))
             if success:
-                asyncio.create_task(_quota_sync(token, int(spec.mode_id)))
+                asyncio.create_task(
+                    _quota_sync(
+                        token,
+                        int(spec.mode_id),
+                        capability="video",
+                        route="videos.generate",
+                        model=spec.model_name,
+                    )
+                ).add_done_callback(_log_task_exception)
             else:
-                asyncio.create_task(_fail_sync(token, int(spec.mode_id), fail_exc))
+                asyncio.create_task(
+                    _fail_sync(
+                        token,
+                        int(spec.mode_id),
+                        fail_exc,
+                        capability="video",
+                        route="videos.generate",
+                        model=spec.model_name,
+                    )
+                ).add_done_callback(_log_task_exception)
 
         path = _save_video_bytes(raw, job.id)
         async with _VIDEO_JOBS_LOCK:

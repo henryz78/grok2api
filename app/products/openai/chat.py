@@ -19,6 +19,7 @@ from app.platform.tokens import (
     estimate_tool_call_tokens,
 )
 from app.control.account.runtime import get_refresh_service
+from app.control.account.activity import record_media_activity
 from app.control.account.invalid_credentials import feedback_kind_for_error
 from app.control.model.registry import resolve as resolve_model
 from app.control.model.enums import ModeId
@@ -118,14 +119,37 @@ def _transport_upstream_error(exc: BaseException, *, context: str) -> UpstreamEr
     )
 
 
-async def _quota_sync(token: str, mode_id: int) -> None:
+async def _quota_sync(
+    token: str,
+    mode_id: int,
+    *,
+    capability: str = "chat",
+    route: str = "",
+    model: str = "",
+) -> None:
     """Fire-and-forget: fetch real quota after a successful call."""
     try:
         if current_strategy() != "quota":
+            if capability in {"image", "video"}:
+                await record_media_activity(
+                    token,
+                    capability=capability,
+                    route=route or capability,
+                    model=model,
+                    success=True,
+                )
             return
         svc = get_refresh_service()
         if svc:
             await svc.refresh_call_async(token, mode_id)
+        if capability in {"image", "video"}:
+            await record_media_activity(
+                token,
+                capability=capability,
+                route=route or capability,
+                model=model,
+                success=True,
+            )
     except Exception as exc:
         logger.warning(
             "chat quota sync failed: token={}... mode_id={} error={}",
@@ -135,7 +159,15 @@ async def _quota_sync(token: str, mode_id: int) -> None:
         )
 
 
-async def _fail_sync(token: str, mode_id: int, exc: BaseException | None = None) -> None:
+async def _fail_sync(
+    token: str,
+    mode_id: int,
+    exc: BaseException | None = None,
+    *,
+    capability: str = "chat",
+    route: str = "",
+    model: str = "",
+) -> None:
     """Fire-and-forget: persist failure metadata after a failed call.
 
     In random mode this helper must not trigger upstream quota probes. It still
@@ -156,6 +188,15 @@ async def _fail_sync(token: str, mode_id: int, exc: BaseException | None = None)
                     result.failed,
                     result.rate_limited,
                 )
+        if capability in {"image", "video"}:
+            await record_media_activity(
+                token,
+                capability=capability,
+                route=route or capability,
+                model=model,
+                success=False,
+                exc=exc,
+            )
     except Exception as e:
         logger.warning(
             "chat fail sync error: token={}... mode_id={} error={}",

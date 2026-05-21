@@ -21,6 +21,7 @@ from app.control.model.registry import resolve as resolve_model
 from app.control.model.enums import ModeId
 from app.control.model.spec import ModelSpec
 from app.control.account.enums import FeedbackKind
+from app.control.account.activity import record_media_activity
 from app.dataplane.reverse.transport.imagine_ws import stream_images
 from app.dataplane.reverse.protocol.xai_chat import (
     StreamAdapter,
@@ -390,6 +391,16 @@ async def generate(
                 await _acct_dir.release(acct)
                 # WS image gen has its own upstream rate limiting — skip quota tracking.
                 # Still propagate auth failures so bad accounts get marked expired.
+                asyncio.create_task(
+                    record_media_activity(
+                        token,
+                        capability="image",
+                        route="images.generate",
+                        model=model,
+                        success=success,
+                        exc=fail_exc,
+                    )
+                ).add_done_callback(_log_task_exception)
                 if not success and fail_exc is not None:
                     kind = _feedback_kind(fail_exc)
                     if kind in (FeedbackKind.UNAUTHORIZED, FeedbackKind.FORBIDDEN):
@@ -456,6 +467,16 @@ async def generate(
     finally:
         await _acct_dir.release(acct)
         # WS image gen has its own upstream rate limiting — skip quota tracking.
+        asyncio.create_task(
+            record_media_activity(
+                token,
+                capability="image",
+                route="images.generate",
+                model=model,
+                success=success,
+                exc=fail_exc,
+            )
+        ).add_done_callback(_log_task_exception)
         if not success and fail_exc is not None:
             kind = _feedback_kind(fail_exc)
             if kind in (FeedbackKind.UNAUTHORIZED, FeedbackKind.FORBIDDEN):
@@ -1061,11 +1082,24 @@ async def _run_lite_request(
             await _acct_dir.feedback(token, kind, int(spec.mode_id))
             if success:
                 asyncio.create_task(
-                    _quota_sync(token, int(spec.mode_id))
+                    _quota_sync(
+                        token,
+                        int(spec.mode_id),
+                        capability="image",
+                        route="images.generate",
+                        model=spec.model_name,
+                    )
                 ).add_done_callback(_log_task_exception)
             else:
                 asyncio.create_task(
-                    _fail_sync(token, int(spec.mode_id), fail_exc)
+                    _fail_sync(
+                        token,
+                        int(spec.mode_id),
+                        fail_exc,
+                        capability="image",
+                        route="images.generate",
+                        model=spec.model_name,
+                    )
                 ).add_done_callback(_log_task_exception)
 
         if retry:
@@ -1226,9 +1260,26 @@ async def edit(
                 kind = FeedbackKind.SUCCESS if success else _feedback_kind(fail_exc) if fail_exc else FeedbackKind.SERVER_ERROR
                 await _acct_dir.feedback(token, kind, int(spec.mode_id))
                 if success:
-                    asyncio.create_task(_quota_sync(token, int(spec.mode_id)))
+                    asyncio.create_task(
+                        _quota_sync(
+                            token,
+                            int(spec.mode_id),
+                            capability="image",
+                            route="images.edit",
+                            model=spec.model_name,
+                        )
+                    ).add_done_callback(_log_task_exception)
                 else:
-                    asyncio.create_task(_fail_sync(token, int(spec.mode_id), fail_exc))
+                    asyncio.create_task(
+                        _fail_sync(
+                            token,
+                            int(spec.mode_id),
+                            fail_exc,
+                            capability="image",
+                            route="images.edit",
+                            model=spec.model_name,
+                        )
+                    ).add_done_callback(_log_task_exception)
 
         return _sse_stream()
 
@@ -1267,9 +1318,26 @@ async def edit(
         kind = FeedbackKind.SUCCESS if success else _feedback_kind(fail_exc) if fail_exc else FeedbackKind.SERVER_ERROR
         await _acct_dir.feedback(token, kind, int(spec.mode_id))
         if success:
-            asyncio.create_task(_quota_sync(token, int(spec.mode_id)))
+            asyncio.create_task(
+                _quota_sync(
+                    token,
+                    int(spec.mode_id),
+                    capability="image",
+                    route="images.edit",
+                    model=spec.model_name,
+                )
+            ).add_done_callback(_log_task_exception)
         else:
-            asyncio.create_task(_fail_sync(token, int(spec.mode_id), fail_exc))
+            asyncio.create_task(
+                _fail_sync(
+                    token,
+                    int(spec.mode_id),
+                    fail_exc,
+                    capability="image",
+                    route="images.edit",
+                    model=spec.model_name,
+                )
+            ).add_done_callback(_log_task_exception)
 
     if chat_format:
         content = "\n\n".join(image.markdown_value for image in images)
