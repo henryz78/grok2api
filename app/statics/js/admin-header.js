@@ -565,8 +565,9 @@ window.renderAdminHeader = async function renderAdminHeader() {
   try {
     const cachedHtml = window.__grok2apiAdminHeaderHtml || readSessionCache(HEADER_HTML_CACHE_KEY);
     const cacheMissingLogs = cachedHtml && !cachedHtml.includes('data-nav="/admin/logs"');
+    const cacheMissingCalls = cachedHtml && !cachedHtml.includes('data-nav="/admin/calls"');
     if (cachedHtml) {
-      if (!cacheMissingLogs) {
+      if (!cacheMissingLogs && !cacheMissingCalls) {
         mount.innerHTML = cachedHtml;
       } else {
         const res = await fetch('/static/admin/header.html');
@@ -598,6 +599,7 @@ window.renderAdminHeader = async function renderAdminHeader() {
             <a href="/admin/account" class="admin-nav-link" data-nav="/admin/account" data-i18n="header.account">账户管理</a>
             <a href="/admin/config" class="admin-nav-link" data-nav="/admin/config" data-i18n="header.config">配置管理</a>
             <a href="/admin/cache" class="admin-nav-link" data-nav="/admin/cache" data-i18n="header.cache">缓存管理</a>
+            <a href="/admin/calls" class="admin-nav-link" data-nav="/admin/calls">调用历史</a>
             <a href="/admin/logs" class="admin-nav-link" data-nav="/admin/logs">日志</a>
           </nav>
           <div class="admin-header-right">

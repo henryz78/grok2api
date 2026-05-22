@@ -10,6 +10,7 @@ from fastapi import Request
 from app.platform.logging.logger import logger
 from app.platform.runtime.clock import now_ms
 from app.platform.storage import call_history_store
+from app.platform.tokens import estimate_prompt_tokens, estimate_tokens
 
 
 def request_client_ip(request: Request | None) -> str:
@@ -40,21 +41,174 @@ def _extract_nested_text(value: Any) -> str:
     if isinstance(value, list):
         return "\n".join(part for part in (_extract_nested_text(item) for item in value) if part)
     if isinstance(value, dict):
+        if isinstance(value.get("reasoning_content"), str):
+            return value["reasoning_content"]
         if isinstance(value.get("text"), str):
             return value["text"]
+        if isinstance(value.get("input_text"), str):
+            return value["input_text"]
         if isinstance(value.get("content"), str):
             return value["content"]
+        if isinstance(value.get("output_text"), str):
+            return value["output_text"]
         if isinstance(value.get("delta"), dict):
             return _extract_nested_text(value["delta"])
         if isinstance(value.get("message"), dict):
             return _extract_nested_text(value["message"])
-        if isinstance(value.get("output_text"), str):
-            return value["output_text"]
+        if isinstance(value.get("choices"), list):
+            return _extract_nested_text(value["choices"])
         if isinstance(value.get("content"), list):
             return _extract_nested_text(value["content"])
+        if isinstance(value.get("input"), list):
+            return _extract_nested_text(value["input"])
         if isinstance(value.get("output"), list):
             return _extract_nested_text(value["output"])
     return ""
+
+
+def _json_or_original(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text or text[0] not in "[{":
+        return value
+    try:
+        return orjson.loads(text)
+    except Exception:
+        return value
+
+
+def _request_content_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                kind = item.get("type")
+                if kind in ("text", "input_text", "output_text"):
+                    text = item.get("text") or item.get("input_text") or item.get("output_text")
+                    if isinstance(text, str):
+                        parts.append(text)
+                elif isinstance(item.get("content"), str):
+                    parts.append(item["content"])
+                continue
+            text = _request_content_text(item)
+            if text:
+                parts.append(text)
+        return "\n".join(parts)
+    if isinstance(value, dict):
+        for key in ("text", "input_text", "output_text", "content"):
+            item = value.get(key)
+            if isinstance(item, str):
+                return item
+            if isinstance(item, list):
+                return _request_content_text(item)
+    return ""
+
+
+def display_text_from_request(value: Any) -> str:
+    """Return human-readable prompt text, excluding tool schemas and transport JSON."""
+
+    parsed = _json_or_original(value)
+    if isinstance(parsed, str):
+        return parsed.strip()
+    if isinstance(parsed, list):
+        return _request_content_text(parsed).strip()
+    if not isinstance(parsed, dict):
+        return str(parsed).strip() if parsed is not None else ""
+
+    parts: list[str] = []
+    instructions = _request_content_text(parsed.get("instructions"))
+    if instructions:
+        parts.append(f"instructions: {instructions}")
+
+    messages = parsed.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "message")
+            text = _request_content_text(message.get("content"))
+            if text:
+                parts.append(f"{role}: {text}")
+
+    input_value = parsed.get("input")
+    if input_value is not None:
+        input_text = _request_content_text(input_value)
+        if input_text:
+            parts.append(f"input: {input_text}")
+
+    prompt = _request_content_text(parsed.get("prompt"))
+    if prompt:
+        parts.append(f"prompt: {prompt}")
+
+    if parts:
+        return "\n\n".join(parts).strip()
+    return _request_content_text(parsed).strip()
+
+
+def display_text_from_response(value: Any) -> str:
+    """Return human-readable response text from JSON payloads or SSE frames."""
+
+    if isinstance(value, str) and "data:" in value:
+        parts: list[str] = []
+        for raw_line in value.splitlines():
+            line = raw_line.strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                payload = orjson.loads(data)
+            except Exception:
+                continue
+            text = _extract_nested_text(payload)
+            if text:
+                parts.append(text)
+        if parts:
+            return "".join(parts).strip()
+
+    parsed = _json_or_original(value)
+    text = _extract_nested_text(parsed)
+    if text:
+        return text.strip()
+    return parsed.strip() if isinstance(parsed, str) else ""
+
+
+def estimate_usage_for_history(request_body: Any, response_text: str) -> dict[str, int | None]:
+    prompt_text = display_text_from_request(request_body)
+    prompt_tokens = estimate_prompt_tokens(prompt_text or request_body)
+    completion_tokens = estimate_tokens(response_text)
+    return {
+        "prompt_tokens": prompt_tokens or None,
+        "completion_tokens": completion_tokens or None,
+        "reasoning_tokens": None,
+        "total_tokens": (prompt_tokens + completion_tokens) if (prompt_tokens or completion_tokens) else None,
+    }
+
+
+def merge_usage_for_history(
+    usage: dict[str, int | None] | None,
+    request_body: Any,
+    response_text: str,
+) -> dict[str, int | None]:
+    estimated = estimate_usage_for_history(request_body, response_text)
+    if not usage:
+        return estimated
+    upstream_total = usage.get("total_tokens")
+    merged = {
+        key: usage.get(key) if usage.get(key) is not None else estimated.get(key)
+        for key in ("prompt_tokens", "completion_tokens", "reasoning_tokens", "total_tokens")
+    }
+    if upstream_total is None and (
+        merged["prompt_tokens"] is not None or merged["completion_tokens"] is not None
+    ):
+        merged["total_tokens"] = int(merged["prompt_tokens"] or 0) + int(merged["completion_tokens"] or 0)
+    return merged
 
 
 def usage_from_payload(payload: dict) -> dict[str, int | None]:
@@ -67,27 +221,47 @@ def usage_from_payload(payload: dict) -> dict[str, int | None]:
             "total_tokens": None,
         }
 
+    def _int_or_none(value: Any) -> int | None:
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
     if "input_tokens" in usage or "output_tokens" in usage:
         reasoning = usage.get("output_tokens_details", {})
+        prompt_tokens = _int_or_none(usage.get("input_tokens"))
+        completion_tokens = _int_or_none(usage.get("output_tokens"))
+        total_tokens = _int_or_none(usage.get("total_tokens"))
         return {
-            "prompt_tokens": usage.get("input_tokens"),
-            "completion_tokens": usage.get("output_tokens"),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
             "reasoning_tokens": (
-                reasoning.get("reasoning_tokens") if isinstance(reasoning, dict) else None
+                _int_or_none(reasoning.get("reasoning_tokens")) if isinstance(reasoning, dict) else None
             ),
-            "total_tokens": usage.get("total_tokens"),
+            "total_tokens": total_tokens if total_tokens is not None else (
+                prompt_tokens + completion_tokens
+                if prompt_tokens is not None and completion_tokens is not None
+                else None
+            ),
         }
 
     completion_details = usage.get("completion_tokens_details", {})
+    prompt_tokens = _int_or_none(usage.get("prompt_tokens"))
+    completion_tokens = _int_or_none(usage.get("completion_tokens"))
+    total_tokens = _int_or_none(usage.get("total_tokens"))
     return {
-        "prompt_tokens": usage.get("prompt_tokens"),
-        "completion_tokens": usage.get("completion_tokens"),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
         "reasoning_tokens": (
-            completion_details.get("reasoning_tokens")
+            _int_or_none(completion_details.get("reasoning_tokens"))
             if isinstance(completion_details, dict)
             else None
         ),
-        "total_tokens": usage.get("total_tokens"),
+        "total_tokens": total_tokens if total_tokens is not None else (
+            prompt_tokens + completion_tokens
+            if prompt_tokens is not None and completion_tokens is not None
+            else None
+        ),
     }
 
 
@@ -138,7 +312,9 @@ async def record_call_history(
 ) -> None:
     try:
         finished_at_ms = now_ms()
-        tokens = usage or {}
+        request_text = display_text_from_request(request_body)
+        response_text = display_text_from_response(response_body)
+        tokens = merge_usage_for_history(usage, request_text or request_body, response_text)
         entry = call_history_store.build_entry(
             created_at_ms=started_at_ms,
             finished_at_ms=finished_at_ms,
@@ -154,9 +330,9 @@ async def record_call_history(
             reasoning_tokens=tokens.get("reasoning_tokens"),
             total_tokens=tokens.get("total_tokens"),
             client_ip=client_ip,
-            request_body=request_body,
-            response_body=response_body or "",
-            response_preview=response_preview,
+            request_body=request_text or request_body,
+            response_body=response_text or response_body or "",
+            response_preview=response_preview or _truncate_history_text(response_text),
             meta=meta or {},
         )
         await call_history_store.record(entry)
@@ -202,7 +378,7 @@ def _capture_sse_data(
             error_message = str(err.get("message") or error_message or "stream error")
             error_type = str(err.get("type") or error_type or "upstream_error")
         extracted_usage = usage_from_payload(payload)
-        if extracted_usage.get("total_tokens") is not None:
+        if any(value is not None for value in extracted_usage.values()):
             usage_holder.update(extracted_usage)
         text = _extract_nested_text(payload)
         if text:
@@ -248,6 +424,7 @@ async def recording_sse(
         error_message = str(exc)
         raise
     finally:
+        response_text = "".join(text_parts)
         await record_call_history(
             started_at_ms=started_at_ms,
             route=route,
@@ -259,9 +436,9 @@ async def recording_sse(
             status_code=status_code,
             error_type=error_type,
             error_message=error_message,
-            response_body="".join(response_parts),
-            response_preview=_truncate_history_text("".join(text_parts)),
-            usage=usage or None,
+            response_body=response_text or "".join(response_parts),
+            response_preview=_truncate_history_text(response_text),
+            usage=merge_usage_for_history(usage, request_body, response_text),
             meta=meta,
         )
 
@@ -269,6 +446,10 @@ async def recording_sse(
 __all__ = [
     "app_error_status",
     "app_error_type",
+    "display_text_from_request",
+    "display_text_from_response",
+    "estimate_usage_for_history",
+    "merge_usage_for_history",
     "record_call_history",
     "recording_sse",
     "request_client_ip",

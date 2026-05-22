@@ -8,6 +8,7 @@ import orjson
 from fastapi import APIRouter, Query
 from fastapi.responses import Response
 
+from app.products.openai.call_history import display_text_from_request, display_text_from_response
 from app.platform.storage import call_history_store, should_expose_sensitive, summarize_call_history
 
 router = APIRouter(prefix="/calls", tags=["Admin - Calls"])
@@ -18,6 +19,14 @@ def _list_item(record, *, include_sensitive: bool) -> dict[str, Any]:
     data.pop("request_body", None)
     data.pop("response_body", None)
     return data
+
+
+def _display_text_from_request(value: Any) -> str:
+    return display_text_from_request(value)
+
+
+def _display_text_from_response(value: Any) -> str:
+    return display_text_from_response(value)
 
 
 @router.get("")
@@ -71,6 +80,9 @@ async def get_call(call_id: str):
             media_type="application/json",
         )
     data = summarize_call_history(record, include_sensitive=include_sensitive)
+    if include_sensitive:
+        data["request_text"] = _display_text_from_request(data.get("request_body") or "")
+        data["response_text"] = _display_text_from_response(data.get("response_body") or "")
     return Response(content=orjson.dumps(data), media_type="application/json")
 
 

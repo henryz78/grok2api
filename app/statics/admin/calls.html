@@ -292,8 +292,8 @@ async function openCallModal(callId) {
       ['路由', data.route || '-'],
       ['Token', `${data.prompt_tokens ?? '—'} / ${data.completion_tokens ?? '—'} / ${data.total_tokens ?? '—'}`],
     ].map(([k, v]) => `<div class="k">${escapeHtml(k)}</div><div>${escapeHtml(v)}</div>`).join('');
-    document.getElementById('call-modal-request').textContent = data.request_body || data.request_preview || '-';
-    document.getElementById('call-modal-response').textContent = data.response_body || data.response_preview || '-';
+    document.getElementById('call-modal-request').textContent = data.request_text || data.request_preview || '-';
+    document.getElementById('call-modal-response').textContent = data.response_text || data.response_preview || '-';
     const errorWrap = document.getElementById('call-modal-error-wrap');
     const errorBody = document.getElementById('call-modal-error');
     if (data.error_message) {
