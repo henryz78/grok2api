@@ -62,6 +62,10 @@ async def admin_cache():
 async def admin_logs():
     return _serve_html("admin/logs.html")
 
+@router.get("/admin/calls", include_in_schema=False)
+async def admin_calls():
+    return _serve_html("admin/calls.html")
+
 
 # --- WebUI ---
 @router.get("/webui", include_in_schema=False)

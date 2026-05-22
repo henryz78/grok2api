@@ -13,10 +13,20 @@ from app.control.account.state_machine import is_manageable
 from app.platform.auth.middleware import verify_api_key
 from app.platform.errors import AppError, ValidationError
 from app.platform.logging.logger import logger
+from app.platform.runtime.clock import now_ms
 from app.platform.storage import image_files_dir, video_files_dir
 from app.control.model import registry as model_registry
 from app.control.model.spec import ModelSpec
 from app.control.account.quota_defaults import supports_mode
+from .call_history import (
+    app_error_status,
+    app_error_type,
+    record_call_history,
+    recording_sse,
+    request_client_ip,
+    response_preview_from_payload,
+    usage_from_payload,
+)
 from .schemas import (
     ChatCompletionRequest,
     ImageGenerationRequest,
@@ -213,22 +223,57 @@ async def _upload_to_data_uri(upload: UploadFile, *, param: str) -> str:
 @router.post(
     "/chat/completions", tags=[_TAG_CHAT], dependencies=[Depends(verify_api_key)]
 )
-async def chat_completions_endpoint(req: ChatCompletionRequest):
-    _validate_chat(req)
+async def chat_completions_endpoint(req: ChatCompletionRequest, request: Request):
     from app.platform.config.snapshot import get_config
 
+    started_at_ms = now_ms()
+    route = "/v1/chat/completions"
+    client_ip = request_client_ip(request)
+    request_body = req.model_dump(exclude_none=True)
     cfg = get_config()
     is_stream = (
         req.stream if req.stream is not None else cfg.get_bool("features.stream", True)
     )
 
+    try:
+        _validate_chat(req)
+    except AppError as exc:
+        await record_call_history(
+            started_at_ms=started_at_ms,
+            route=route,
+            model=req.model,
+            stream=is_stream,
+            request_body=request_body,
+            client_ip=client_ip,
+            success=False,
+            status_code=app_error_status(exc),
+            error_type=app_error_type(exc),
+            error_message=str(exc),
+            meta={"capability": "chat", "phase": "validation"},
+        )
+        raise
+
     spec = model_registry.get(req.model)
     if spec is None:
-        raise ValidationError(
+        exc = ValidationError(
             f"Model {req.model!r} does not exist or you do not have access to it.",
             param="model",
             code="model_not_found",
         )
+        await record_call_history(
+            started_at_ms=started_at_ms,
+            route=route,
+            model=req.model,
+            stream=is_stream,
+            request_body=request_body,
+            client_ip=client_ip,
+            success=False,
+            status_code=app_error_status(exc),
+            error_type=app_error_type(exc),
+            error_message=str(exc),
+            meta={"capability": "chat", "phase": "validation"},
+        )
+        raise exc
     messages = [m.model_dump(exclude_none=True) for m in req.messages]
 
     try:
@@ -312,7 +357,20 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
                 reasoning_effort=req.reasoning_effort,
             )
 
-    except AppError:
+    except AppError as exc:
+        await record_call_history(
+            started_at_ms=started_at_ms,
+            route=route,
+            model=req.model,
+            stream=is_stream,
+            request_body=request_body,
+            client_ip=client_ip,
+            success=False,
+            status_code=app_error_status(exc),
+            error_type=app_error_type(exc),
+            error_message=str(exc),
+            meta={"capability": "chat"},
+        )
         raise
     except Exception as exc:
         logger.exception(
@@ -334,14 +392,61 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
                 yield "data: [DONE]\n\n"
 
             return StreamingResponse(
-                _err_stream(), media_type="text/event-stream", headers=_SSE_HEADERS
+                recording_sse(
+                    _err_stream(),
+                    started_at_ms=started_at_ms,
+                    route=route,
+                    model=req.model,
+                    request_body=request_body,
+                    client_ip=client_ip,
+                    meta={"capability": "chat"},
+                ),
+                media_type="text/event-stream",
+                headers=_SSE_HEADERS,
             )
+        await record_call_history(
+            started_at_ms=started_at_ms,
+            route=route,
+            model=req.model,
+            stream=False,
+            request_body=request_body,
+            client_ip=client_ip,
+            success=False,
+            status_code=500,
+            error_type=exc.__class__.__name__,
+            error_message=str(exc),
+            meta={"capability": "chat"},
+        )
         raise
 
     if isinstance(result, dict):
+        await record_call_history(
+            started_at_ms=started_at_ms,
+            route=route,
+            model=req.model,
+            stream=False,
+            request_body=request_body,
+            response_body=result,
+            response_preview=response_preview_from_payload(result),
+            client_ip=client_ip,
+            success=True,
+            status_code=200,
+            usage=usage_from_payload(result),
+            meta={"capability": "chat"},
+        )
         return JSONResponse(result)
     return StreamingResponse(
-        _safe_sse(result), media_type="text/event-stream", headers=_SSE_HEADERS
+        recording_sse(
+            _safe_sse(result),
+            started_at_ms=started_at_ms,
+            route=route,
+            model=req.model,
+            request_body=request_body,
+            client_ip=client_ip,
+            meta={"capability": "chat"},
+        ),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
     )
 
 
@@ -375,24 +480,44 @@ async def _safe_sse_responses(stream) -> AsyncGenerator[str, None]:
 @router.post(
     "/responses", tags=[_TAG_RESPONSES], dependencies=[Depends(verify_api_key)]
 )
-async def responses_endpoint(req: ResponsesCreateRequest):
+async def responses_endpoint(req: ResponsesCreateRequest, request: Request):
     from app.platform.config.snapshot import get_config
     from app.platform.errors import ValidationError as _ValidationError
 
-    spec = model_registry.get(req.model)
-    if spec is None or not spec.enabled:
-        raise _ValidationError(
-            f"Model {req.model!r} does not exist or you do not have access to it.",
-            param="model",
-            code="model_not_found",
-        )
-    if not req.input:
-        raise _ValidationError("input cannot be empty", param="input")
-
+    started_at_ms = now_ms()
+    route = "/v1/responses"
+    client_ip = request_client_ip(request)
+    request_body = req.model_dump(exclude_none=True)
     cfg = get_config()
     is_stream = (
         req.stream if req.stream is not None else cfg.get_bool("features.stream", True)
     )
+
+    try:
+        spec = model_registry.get(req.model)
+        if spec is None or not spec.enabled:
+            raise _ValidationError(
+                f"Model {req.model!r} does not exist or you do not have access to it.",
+                param="model",
+                code="model_not_found",
+            )
+        if not req.input:
+            raise _ValidationError("input cannot be empty", param="input")
+    except AppError as exc:
+        await record_call_history(
+            started_at_ms=started_at_ms,
+            route=route,
+            model=req.model,
+            stream=is_stream,
+            request_body=request_body,
+            client_ip=client_ip,
+            success=False,
+            status_code=app_error_status(exc),
+            error_type=app_error_type(exc),
+            error_message=str(exc),
+            meta={"capability": "responses", "phase": "validation"},
+        )
+        raise
 
     # Map reasoning param → emit_think flag.
     # reasoning=None → use config; reasoning.effort="none" → off; otherwise on.
@@ -411,23 +536,61 @@ async def responses_endpoint(req: ResponsesCreateRequest):
 
     from .responses import create as responses_create
 
-    result = await responses_create(
-        model=req.model,
-        input_val=req.input,
-        instructions=req.instructions,
-        stream=is_stream,
-        emit_think=emit_think,
-        temperature=req.temperature or 0.8,
-        top_p=req.top_p or 0.95,
-        reasoning_effort=reasoning_effort,
-        tools=req.tools or None,
-        tool_choice=req.tool_choice,
-    )
+    try:
+        result = await responses_create(
+            model=req.model,
+            input_val=req.input,
+            instructions=req.instructions,
+            stream=is_stream,
+            emit_think=emit_think,
+            temperature=req.temperature or 0.8,
+            top_p=req.top_p or 0.95,
+            reasoning_effort=reasoning_effort,
+            tools=req.tools or None,
+            tool_choice=req.tool_choice,
+        )
+    except AppError as exc:
+        await record_call_history(
+            started_at_ms=started_at_ms,
+            route=route,
+            model=req.model,
+            stream=is_stream,
+            request_body=request_body,
+            client_ip=client_ip,
+            success=False,
+            status_code=app_error_status(exc),
+            error_type=app_error_type(exc),
+            error_message=str(exc),
+            meta={"capability": "responses"},
+        )
+        raise
 
     if isinstance(result, dict):
+        await record_call_history(
+            started_at_ms=started_at_ms,
+            route=route,
+            model=req.model,
+            stream=False,
+            request_body=request_body,
+            response_body=result,
+            response_preview=response_preview_from_payload(result),
+            client_ip=client_ip,
+            success=True,
+            status_code=200,
+            usage=usage_from_payload(result),
+            meta={"capability": "responses"},
+        )
         return JSONResponse(result)
     return StreamingResponse(
-        _safe_sse_responses(result),
+        recording_sse(
+            _safe_sse_responses(result),
+            started_at_ms=started_at_ms,
+            route=route,
+            model=req.model,
+            request_body=request_body,
+            client_ip=client_ip,
+            meta={"capability": "responses"},
+        ),
         media_type = "text/event-stream",
         headers    = _SSE_HEADERS,
     )

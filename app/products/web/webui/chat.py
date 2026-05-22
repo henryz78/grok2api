@@ -48,8 +48,8 @@ async def list_webui_models(request: Request):
 
 
 @router.post("/chat/completions")
-async def webui_chat_completions(req: ChatCompletionRequest):
-    return await chat_completions_endpoint(req)
+async def webui_chat_completions(req: ChatCompletionRequest, request: Request):
+    return await chat_completions_endpoint(req, request)
 
 
 __all__ = ["router"]
