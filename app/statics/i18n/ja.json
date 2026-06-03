@@ -391,7 +391,7 @@
         "thinking": { "label": "デフォルトの推論出力" },
         "autoChatModeFallback": { "label": "AUTO チャットモードのフォールバック" },
         "thinkingSummary": { "label": "思考要約出力" },
-        "dynamicStatsig": { "label": "動的 Statsig" },
+        "statsigId": { "label": "手動 Statsig ID", "desc": "ブラウザーセッションから取得した x-statsig-id を任意で設定できます。空の場合はブラウザー fallback 値を自動生成します。" },
         "enableNsfw": { "label": "NSFW 生成を許可" },
         "showSearchSources": { "label": "コンテンツにソースを追加", "desc": "検索ソースは常に search_sources フィールドに出力されます。このオプションは、テキスト解析クライアントとの互換性のために ## Sources セクションをコンテンツに追加するかどうかを制御します。" },
         "customInstruction": { "label": "グローバル補助指示" },

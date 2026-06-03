@@ -66,18 +66,17 @@ def _sanitize(value: Optional[str], *, field: str, strip_spaces: bool = False) -
 
 def _statsig_id() -> str:
     cfg = get_config()
-    if cfg.get_bool("features.dynamic_statsig", False):
-        if random.choice((True, False)):
-            rand = "".join(random.choices(string.ascii_lowercase + string.digits, k=5))
-            msg = f"e:TypeError: Cannot read properties of null (reading 'children['{rand}']')"
-        else:
-            rand = "".join(random.choices(string.ascii_lowercase, k=10))
-            msg = f"e:TypeError: Cannot read properties of undefined (reading '{rand}')"
-        return base64.b64encode(msg.encode()).decode()
-    return (
-        "ZTpUeXBlRXJyb3I6IENhbm5vdCByZWFkIHByb3BlcnRpZXMgb2YgdW5kZWZpbmVkIChyZWFkaW5nICdjaGls"
-        "ZE5vZGVzJyk="
-    )
+    manual = _sanitize(cfg.get_str("features.statsig_id", ""), field="statsig_id", strip_spaces=True)
+    if manual:
+        return manual
+
+    if random.choice((True, False)):
+        rand = "".join(random.choices(string.ascii_lowercase + string.digits, k=5))
+        msg = f"x1:TypeError: Cannot read properties of null (reading 'children[\\'{rand}\\']')"
+    else:
+        rand = "".join(random.choices(string.ascii_lowercase, k=10))
+        msg = f"x1:TypeError: Cannot read properties of undefined (reading '{rand}')"
+    return base64.b64encode(msg.encode()).decode()
 
 
 # ---------------------------------------------------------------------------

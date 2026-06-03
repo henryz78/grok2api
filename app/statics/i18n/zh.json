@@ -425,9 +425,9 @@
           "label": "思考精简输出",
           "desc": "启用后将思考过程提炼为结构化摘要。关闭时输出完整的原始推理过程，支持多 Agent 模型的协作详情与工具调用展示。"
         },
-        "dynamicStatsig": {
-          "label": "动态 Statsig",
-          "desc": "为每次请求动态生成 Statsig 设备指纹，以降低风控拦截概率。"
+        "statsigId": {
+          "label": "手动 Statsig ID",
+          "desc": "可填浏览器抓包得到的 x-statsig-id。留空时自动生成浏览器 fallback 格式。"
         },
         "enableNsfw": {
           "label": "允许 NSFW 生成",

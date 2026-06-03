@@ -38,7 +38,7 @@ def _install_common_stubs() -> None:
         tiktoken = types.ModuleType("tiktoken")
 
         class _Encoding:
-            def encode(self, text):
+            def encode(self, text, *args, **kwargs):
                 return list((text or "").encode("utf-8"))
 
         tiktoken.Encoding = _Encoding
