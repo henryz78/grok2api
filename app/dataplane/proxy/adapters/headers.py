@@ -13,7 +13,6 @@ from urllib.parse import urlparse
 
 
 from app.platform.logging.logger import logger
-from app.platform.config.snapshot import get_config
 from app.control.proxy.models import ProxyLease
 from app.dataplane.proxy.adapters.profile import ProxyProfile, resolve_proxy_profile
 
@@ -65,11 +64,17 @@ def _sanitize(value: Optional[str], *, field: str, strip_spaces: bool = False) -
 
 
 def _statsig_id() -> str:
-    cfg = get_config()
-    manual = _sanitize(cfg.get_str("features.statsig_id", ""), field="statsig_id", strip_spaces=True)
-    if manual:
-        return manual
+    """Generate a Statsig evaluation fallback ID.
 
+    The real browser's fetch interceptor tries to evaluate Statsig gates for
+    each request.  When the Statsig SDK is not yet initialised (headless,
+    first paint, etc.) it catches the error and falls back to::
+
+        btoa("x1:" + error.toString())
+
+    The server accepts this fallback.  We reproduce the exact format with
+    varied error messages to avoid a static fingerprint.
+    """
     if random.choice((True, False)):
         rand = "".join(random.choices(string.ascii_lowercase + string.digits, k=5))
         msg = f"x1:TypeError: Cannot read properties of null (reading 'children[\\'{rand}\\']')"

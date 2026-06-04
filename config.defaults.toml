@@ -36,8 +36,8 @@ auto_chat_mode_fallback = true
 thinking_summary = false
 # 调用历史页面是否显示 IP、请求与响应正文
 call_history_show_sensitive = false
-# 手动 x-statsig-id；留空时自动生成浏览器 fallback 格式
-statsig_id = ""
+# 是否动态生成 Statsig 指纹
+dynamic_statsig = true
 # 是否允许生成 NSFW 图片
 enable_nsfw = true
 # 搜索信源始终以 search_sources 结构化字段输出（无需此开关）。

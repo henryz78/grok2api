@@ -391,7 +391,7 @@
         "thinking": { "label": "Salida de razonamiento predeterminada" },
         "autoChatModeFallback": { "label": "Reserva de modo AUTO para chat" },
         "thinkingSummary": { "label": "Razonamiento condensado" },
-        "statsigId": { "label": "ID de Statsig manual", "desc": "x-statsig-id opcional capturado de una sesión del navegador. Si se deja vacío, se genera automáticamente un valor fallback de navegador." },
+        "dynamicStatsig": { "label": "Statsig dinámico" },
         "enableNsfw": { "label": "Permitir generación NSFW" },
         "showSearchSources": { "label": "Agregar fuentes al contenido", "desc": "Las fuentes de búsqueda siempre se incluyen en el campo search_sources. Esta opción controla si también se agrega una sección ## Sources al contenido (para compatibilidad con clientes que analizan texto)." },
         "customInstruction": { "label": "Instrucción suplementaria global" },

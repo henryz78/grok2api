@@ -35,19 +35,6 @@ def _install_common_stubs() -> None:
         sys.modules["curl_cffi.const"] = const
 
 
-class _Config:
-    def __init__(self, values: dict[str, object] | None = None) -> None:
-        self._values = values or {}
-
-    def get_str(self, key: str, default: str = "") -> str:
-        value = self._values.get(key, default)
-        return str(value) if value is not None else default
-
-    def get_bool(self, key: str, default: bool = False) -> bool:
-        value = self._values.get(key, default)
-        return bool(value)
-
-
 class StatsigHeadersTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -56,20 +43,7 @@ class StatsigHeadersTests(unittest.TestCase):
 
         cls.headers = headers
 
-    def setUp(self):
-        self._original_get_config = self.headers.get_config
-
-    def tearDown(self):
-        self.headers.get_config = self._original_get_config
-
-    def test_manual_statsig_id_takes_precedence(self):
-        self.headers.get_config = lambda: _Config({"features.statsig_id": "  manual-statsig\n"})
-
-        self.assertEqual(self.headers._statsig_id(), "manual-statsig")
-
-    def test_generated_statsig_matches_browser_fallback_prefix(self):
-        self.headers.get_config = lambda: _Config()
-
+    def test_generated_statsig_matches_official_browser_fallback_prefix(self):
         decoded = base64.b64decode(self.headers._statsig_id()).decode()
 
         self.assertTrue(decoded.startswith("x1:TypeError:"), decoded)

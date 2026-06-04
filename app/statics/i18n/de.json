@@ -391,7 +391,7 @@
         "thinking": { "label": "Standard-Ausgabe für Reasoning" },
         "autoChatModeFallback": { "label": "AUTO-Chatmodus-Fallback" },
         "thinkingSummary": { "label": "Kompakte Reasoning-Ausgabe" },
-        "statsigId": { "label": "Manuelle Statsig-ID", "desc": "Optional aus einer Browsersitzung erfasste x-statsig-id. Wenn leer, wird automatisch ein Browser-Fallback-Wert erzeugt." },
+        "dynamicStatsig": { "label": "Dynamisches Statsig" },
         "enableNsfw": { "label": "NSFW-Erzeugung zulassen" },
         "showSearchSources": { "label": "Quellen an Inhalt anhängen", "desc": "Suchquellen werden immer im Feld search_sources ausgegeben. Diese Option steuert, ob zusätzlich ein ## Sources-Abschnitt an den Inhalt angehängt wird (für Abwärtskompatibilität mit textbasierten Clients)." },
         "customInstruction": { "label": "Globale Zusatzanweisung" },

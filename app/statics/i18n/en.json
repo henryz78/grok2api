@@ -425,9 +425,9 @@
           "label": "Condensed Reasoning",
           "desc": "When enabled, reasoning steps are condensed into a structured summary. When disabled, the full raw reasoning stream is output, with multi-agent collaboration details and tool call traces."
         },
-        "statsigId": {
-          "label": "Manual Statsig ID",
-          "desc": "Optional x-statsig-id captured from a browser session. When empty, a browser fallback value is generated automatically."
+        "dynamicStatsig": {
+          "label": "Dynamic Statsig",
+          "desc": "Generates a fresh Statsig device fingerprint for each request to reduce the likelihood of risk-control challenges."
         },
         "enableNsfw": {
           "label": "Allow NSFW Generation",
