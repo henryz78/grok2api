@@ -127,7 +127,14 @@ async def _do_fetch(token: str, mode_name: str) -> dict:
 
 async def _fetch_one(token: str, mode_id: int) -> object | None:
     """Fetch quota window for a single mode. Returns QuotaWindow or None."""
-    mode_name = _MODE_NAMES.get(mode_id, "auto")
+    mode_name = _MODE_NAMES.get(mode_id)
+    if mode_name is None:
+        logger.debug(
+            "rate-limits fetch skipped: token={}... mode_id={} reason=unsupported_mode",
+            token[:10],
+            mode_id,
+        )
+        return None
     try:
         body = await asyncio.wait_for(_do_fetch(token, mode_name), timeout=25.0)
     except asyncio.TimeoutError:
@@ -174,7 +181,8 @@ async def fetch_all_quotas(
 
     ``mode_ids`` defaults to ``(0, 1, 2, 3, 4)``. Returns ``{mode_id: QuotaWindow}``
     for every mode that responded successfully, or ``None`` if every requested
-    mode failed.
+    mode failed. Unknown local-only modes are skipped instead of falling back to
+    ``auto``.
     """
     import asyncio
 

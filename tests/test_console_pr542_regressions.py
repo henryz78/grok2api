@@ -249,6 +249,85 @@ class ConsoleReasoningDefaultsTests(unittest.TestCase):
             self.registry.resolve("grok-4.20")
 
 
+class ConsoleQuotaIsolationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        _install_common_stubs()
+        cls.registry = importlib.import_module("app.control.model.registry")
+        cls.model_enums = importlib.import_module("app.control.model.enums")
+        cls.quota_defaults = importlib.import_module("app.control.account.quota_defaults")
+        cls.account_models = importlib.import_module("app.control.account.models")
+        cls.account_sync = importlib.import_module("app.dataplane.account.sync")
+
+    def test_c_prefixed_console_models_use_console_mode(self):
+        console_mode = self.model_enums.ModeId.CONSOLE
+        for model_name in (
+            "c/grok-4.3",
+            "c/grok-4.20-reasoning",
+            "c/grok-4.20-non-reasoning",
+            "c/grok-4.20-multi-agent",
+        ):
+            with self.subTest(model_name=model_name):
+                spec = self.registry.resolve(model_name)
+                self.assertTrue(spec.is_console())
+                self.assertEqual(spec.mode_id, console_mode)
+
+    def test_basic_pool_has_independent_console_quota_window(self):
+        console_mode = int(self.model_enums.ModeId.CONSOLE)
+        quota_set = self.quota_defaults.default_quota_set("basic")
+
+        self.assertTrue(self.quota_defaults.supports_mode("basic", console_mode))
+        self.assertIn(console_mode, self.quota_defaults.supported_mode_ids("basic"))
+        self.assertIsNotNone(quota_set.console)
+        self.assertEqual(quota_set.fast.total, 30)
+        self.assertEqual(quota_set.fast.window_seconds, 86_400)
+        self.assertEqual(quota_set.console.total, 30)
+        self.assertEqual(quota_set.console.window_seconds, 900)
+
+    def test_runtime_sync_indexes_console_quota_separately_from_fast(self):
+        console_mode = int(self.model_enums.ModeId.CONSOLE)
+        quota_set = self.quota_defaults.default_quota_set("basic")
+        quota_set.fast.remaining = 0
+        quota_set.console.remaining = 7
+        record = self.account_models.AccountRecord(
+            token="token-for-console-quota-test",
+            pool="basic",
+            quota=quota_set.to_dict(),
+        )
+
+        args = self.account_sync._record_to_slot_args(record)
+
+        self.assertEqual(args["quota_fast"], 0)
+        self.assertEqual(args["quota_console"], 7)
+        self.assertEqual(args["window_fast"], 86_400)
+        self.assertEqual(args["window_console"], 900)
+        self.assertEqual(console_mode, 5)
+
+    def test_console_mode_quota_refresh_does_not_hit_grok_rate_limits(self):
+        console_mode = int(self.model_enums.ModeId.CONSOLE)
+        xai_usage = importlib.import_module("app.dataplane.reverse.protocol.xai_usage")
+        calls = []
+        original_do_fetch = xai_usage._do_fetch
+
+        async def _fake_do_fetch(_token, mode_name):
+            calls.append(mode_name)
+            return {
+                "remainingQueries": 99,
+                "totalQueries": 99,
+                "windowSizeSeconds": 7200,
+            }
+
+        async def _run():
+            xai_usage._do_fetch = _fake_do_fetch
+            try:
+                return await xai_usage.fetch_mode_quota("token", console_mode)
+            finally:
+                xai_usage._do_fetch = original_do_fetch
+
+        self.assertIsNone(asyncio.run(_run()))
+        self.assertEqual(calls, [])
+
+
 class AnthropicConsoleBridgeRegressionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

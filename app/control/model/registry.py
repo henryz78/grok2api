@@ -39,10 +39,10 @@ MODELS: tuple[ModelSpec, ...] = (
     # === Console API (console.x.ai/v1/responses) ============================
     # 通过 SSO cookie 直接调用 console.x.ai，basic 账号即可使用这组确认可用的模型。
     # 对外统一加上 c/ 前缀，和官方 grok.com / imagine 路由彻底分开。
-    ModelSpec("c/grok-4.3",                             ModeId.FAST, Tier.BASIC, Capability.CHAT,           True, "c/Grok 4.3",                            console_model="grok-4.3",                       default_reasoning_effort="high"),
-    ModelSpec("c/grok-4.20-reasoning",                  ModeId.FAST, Tier.BASIC, Capability.CHAT,           True, "c/Grok 4.20 Reasoning",                 console_model="grok-4.20-0309-reasoning"),
-    ModelSpec("c/grok-4.20-non-reasoning",              ModeId.FAST, Tier.BASIC, Capability.CHAT,           True, "c/Grok 4.20 Non-Reasoning",             console_model="grok-4.20-0309-non-reasoning"),
-    ModelSpec("c/grok-4.20-multi-agent",                ModeId.FAST, Tier.BASIC, Capability.CHAT,           True, "c/Grok 4.20 Multi-Agent",               console_model="grok-4.20-multi-agent-0309"),
+    ModelSpec("c/grok-4.3",                             ModeId.CONSOLE, Tier.BASIC, Capability.CHAT,        True, "c/Grok 4.3",                            console_model="grok-4.3",                       default_reasoning_effort="high"),
+    ModelSpec("c/grok-4.20-reasoning",                  ModeId.CONSOLE, Tier.BASIC, Capability.CHAT,        True, "c/Grok 4.20 Reasoning",                 console_model="grok-4.20-0309-reasoning"),
+    ModelSpec("c/grok-4.20-non-reasoning",              ModeId.CONSOLE, Tier.BASIC, Capability.CHAT,        True, "c/Grok 4.20 Non-Reasoning",             console_model="grok-4.20-0309-non-reasoning"),
+    ModelSpec("c/grok-4.20-multi-agent",                ModeId.CONSOLE, Tier.BASIC, Capability.CHAT,        True, "c/Grok 4.20 Multi-Agent",               console_model="grok-4.20-multi-agent-0309"),
 
     # === Image ==============================================================
 
