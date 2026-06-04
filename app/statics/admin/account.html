@@ -98,7 +98,7 @@
     /* Stats */
     .stat-grid {
       display:grid;
-      grid-template-columns:repeat(5, minmax(0, 1fr));
+      grid-template-columns:repeat(6, minmax(0, 1fr));
       gap:12px;
       margin-bottom:20px;
     }
@@ -353,6 +353,10 @@
       font-size:10px;
     }
     @media (max-width: 720px) {
+      .stat-grid,
+      .stat-grid.mode-random {
+        grid-template-columns:repeat(2, minmax(0, 1fr));
+      }
       .toolbar-dropdown-panel {
         right:-8px;
         width:min(320px, calc(100vw - 20px));
