@@ -66,6 +66,7 @@ _TOOL_EMOJI = {
     "web_search": "🔍",
     "x_search": "🔍",
 }
+_MULTI_AGENT_CONSOLE_MODEL = "grok-4.20-multi-agent-0309"
 
 # ---------------------------------------------------------------------------
 # Input conversion (OpenAI Chat Completions → console.x.ai input array)
@@ -284,6 +285,36 @@ def convert_openai_tool_choice(tool_choice: Any) -> Any:
             return {"type": "function", "name": fn.get("name") or ""}
         return dict(tool_choice)
     return tool_choice
+
+
+def filter_console_tools_for_model(
+    console_model: str,
+    tools: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Remove client-side function tools from restricted console models.
+
+    Multi-agent currently rejects client-side function tools with a beta access
+    error. Built-in server-side tools such as ``web_search`` and ``x_search``
+    are still accepted, so keep those and only drop ``type=function`` entries.
+    """
+    if not tools:
+        return []
+    if console_model != _MULTI_AGENT_CONSOLE_MODEL:
+        return list(tools)
+    filtered = [
+        dict(tool)
+        for tool in tools
+        if isinstance(tool, dict) and tool.get("type") != "function"
+    ]
+    dropped = len(tools) - len(filtered)
+    if dropped:
+        logger.info(
+            "console client tools filtered: model={} dropped={} kept={}",
+            console_model,
+            dropped,
+            len(filtered),
+        )
+    return filtered
 
 
 # ---------------------------------------------------------------------------
@@ -1056,6 +1087,7 @@ __all__ = [
     "build_console_payload",
     "convert_openai_tools_to_console",
     "convert_openai_tool_choice",
+    "filter_console_tools_for_model",
     "inject_web_search_tool",
     "extract_console_text",
     "extract_console_reasoning",

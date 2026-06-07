@@ -123,6 +123,47 @@ class ConsoleProtocolRegressionTests(unittest.TestCase):
         self.assertEqual(exc.status, 502)
         self.assertIn("credits exhausted", exc.message)
 
+    def test_multi_agent_filters_client_function_tools(self):
+        tools = self.xai_console.convert_openai_tools_to_console(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {"type": "object"},
+                    },
+                },
+                {"type": "web_search"},
+            ]
+        )
+
+        filtered = self.xai_console.filter_console_tools_for_model(
+            "grok-4.20-multi-agent-0309",
+            tools,
+        )
+
+        self.assertEqual(filtered, [{"type": "web_search"}])
+
+    def test_non_multi_agent_keeps_client_function_tools(self):
+        tools = self.xai_console.convert_openai_tools_to_console(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {"type": "object"},
+                    },
+                },
+                {"type": "web_search"},
+            ]
+        )
+
+        filtered = self.xai_console.filter_console_tools_for_model("grok-4.3", tools)
+
+        self.assertEqual([tool["type"] for tool in filtered], ["function", "web_search"])
+
     def test_normalize_console_usage_does_not_double_count_reasoning(self):
         usage = self.xai_console.normalize_console_usage(
             {
@@ -227,6 +268,23 @@ class ConsoleReasoningDefaultsTests(unittest.TestCase):
             self.registry.resolve("c/grok-4.20-multi-agent").default_reasoning_effort,
             "",
         )
+
+    def test_console_effort_variant_models_resolve_to_upstream_console_models(self):
+        cases = {
+            "c/grok-4.3-low": ("grok-4.3", "low"),
+            "c/grok-4.3-medium": ("grok-4.3", "medium"),
+            "c/grok-4.3-high": ("grok-4.3", "high"),
+            "c/grok-4.20-multi-agent-low": ("grok-4.20-multi-agent-0309", "low"),
+            "c/grok-4.20-multi-agent-medium": ("grok-4.20-multi-agent-0309", "medium"),
+            "c/grok-4.20-multi-agent-high": ("grok-4.20-multi-agent-0309", "high"),
+            "c/grok-4.20-multi-agent-xhigh": ("grok-4.20-multi-agent-0309", "xhigh"),
+        }
+
+        for model_name, (console_model, effort) in cases.items():
+            with self.subTest(model_name=model_name):
+                spec = self.registry.resolve(model_name)
+                self.assertEqual(spec.console_model, console_model)
+                self.assertEqual(spec.default_reasoning_effort, effort)
 
     def test_console_aliases_resolve_to_canonical_c_prefixed_models(self):
         self.assertEqual(

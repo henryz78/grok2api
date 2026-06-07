@@ -49,6 +49,7 @@ from app.dataplane.reverse.protocol.xai_console import (
     extract_console_text,
     extract_console_tool_calls,
     extract_console_usage,
+    filter_console_tools_for_model,
     normalize_console_usage,
     inject_web_search_tool,
     parse_console_error,
@@ -617,6 +618,7 @@ async def _console_completions(
 
     # Convert OpenAI tools → console tools (flat name/description/parameters).
     console_tools = convert_openai_tools_to_console(tools) if tools else None
+    console_tools = filter_console_tools_for_model(console_model, console_tools)
     console_tool_choice = (
         convert_openai_tool_choice(tool_choice) if console_tools and tool_choice is not None else None)
 

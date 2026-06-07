@@ -24,6 +24,7 @@ from app.dataplane.reverse.protocol.xai_console import (
     convert_openai_tools_to_console,
     extract_console_sse_error,
     extract_console_usage,
+    filter_console_tools_for_model,
     inject_console_reasoning_output,
     inject_web_search_tool,
 )
@@ -279,6 +280,7 @@ async def _console_responses_dispatch(
     # Tools may arrive in either Chat Completions wrapper format or
     # Responses API flat format; convert_openai_tools_to_console handles both.
     console_tools = convert_openai_tools_to_console(tools) if tools else None
+    console_tools = filter_console_tools_for_model(console_model, console_tools)
     console_tool_choice = (
         convert_openai_tool_choice(tool_choice) if console_tools and tool_choice is not None else None)
 
