@@ -130,7 +130,8 @@ async def _quota_sync(
 ) -> None:
     """Fire-and-forget: fetch real quota after a successful call."""
     try:
-        if current_strategy() != "quota":
+        is_console_mode = mode_id == int(ModeId.CONSOLE)
+        if current_strategy() != "quota" and not is_console_mode:
             if capability in {"image", "video"}:
                 await record_media_activity(
                     token,
