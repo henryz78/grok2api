@@ -209,6 +209,98 @@ class AccountRefreshBootstrapTests(unittest.TestCase):
         self.assertEqual(restored.total, 30)
         self.assertEqual(restored.window_seconds, 900)
 
+    def test_refresh_call_async_console_deducts_locally_without_upstream_fetch(self):
+        patches = []
+        quota_set = self.quota_defaults.default_quota_set("basic")
+        assert quota_set.console is not None
+        quota_set.console.remaining = 30
+        quota_set.console.reset_at = None
+        record = self.models.AccountRecord(
+            token="tok-console-local",
+            pool="basic",
+            quota=quota_set.to_dict(),
+        )
+
+        class _Repo:
+            async def get_accounts(self, tokens):
+                return [record]
+
+            async def patch_accounts(self, account_patches):
+                patches.extend(account_patches)
+
+        class _Service(self.refresh_mod.AccountRefreshService):
+            async def _fetch_mode_quota(self, token, pool, mode_id):
+                raise AssertionError("console quota must stay local")
+
+        async def _run():
+            svc = _Service(_Repo())
+            await svc.refresh_call_async("tok-console-local", 5)
+
+        asyncio.run(_run())
+
+        self.assertEqual(len(patches), 1)
+        patched = patches[0]
+        window = self.models.QuotaWindow.from_dict(patched.quota_console)
+        self.assertEqual(window.remaining, 29)
+        self.assertIsNone(window.reset_at)
+        self.assertEqual(patched.usage_use_delta, 1)
+        self.assertIsNone(patched.usage_sync_delta)
+
+    def test_console_local_deduct_starts_reset_timer_at_half_quota(self):
+        patches = []
+        quota_set = self.quota_defaults.default_quota_set("basic")
+        assert quota_set.console is not None
+        quota_set.console.remaining = 16
+        quota_set.console.reset_at = None
+        record = self.models.AccountRecord(
+            token="tok-console-threshold",
+            pool="basic",
+            quota=quota_set.to_dict(),
+        )
+
+        class _Repo:
+            async def patch_accounts(self, account_patches):
+                patches.extend(account_patches)
+
+        async def _run():
+            svc = self.refresh_mod.AccountRefreshService(_Repo())
+            await svc._apply_single_mode(record, 5, None, is_use=True, use_at_ms=1234)
+
+        asyncio.run(_run())
+
+        window = self.models.QuotaWindow.from_dict(patches[0].quota_console)
+        self.assertEqual(window.remaining, 15)
+        self.assertIsNotNone(window.reset_at)
+        self.assertEqual(window.window_seconds, 900)
+
+    def test_console_local_deduct_resets_expired_window_before_counting_call(self):
+        patches = []
+        quota_set = self.quota_defaults.default_quota_set("basic")
+        assert quota_set.console is not None
+        quota_set.console.remaining = 0
+        quota_set.console.reset_at = 1
+        record = self.models.AccountRecord(
+            token="tok-console-expired-use",
+            pool="basic",
+            quota=quota_set.to_dict(),
+        )
+
+        class _Repo:
+            async def patch_accounts(self, account_patches):
+                patches.extend(account_patches)
+
+        async def _run():
+            svc = self.refresh_mod.AccountRefreshService(_Repo())
+            await svc._apply_single_mode(record, 5, None, is_use=True, use_at_ms=1234)
+
+        asyncio.run(_run())
+
+        window = self.models.QuotaWindow.from_dict(patches[0].quota_console)
+        self.assertEqual(window.remaining, 29)
+        self.assertEqual(window.total, 30)
+        self.assertIsNotNone(window.reset_at)
+        self.assertEqual(window.source, self.enums.QuotaSource.DEFAULT)
+
 
 class ConsoleQuotaSyncTests(unittest.TestCase):
     def test_console_quota_sync_runs_in_random_strategy(self):
