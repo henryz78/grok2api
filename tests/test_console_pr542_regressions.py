@@ -286,6 +286,17 @@ class ConsoleReasoningDefaultsTests(unittest.TestCase):
                 self.assertEqual(spec.console_model, console_model)
                 self.assertEqual(spec.default_reasoning_effort, effort)
 
+    def test_grok_build_console_model_uses_clean_c_prefixed_name(self):
+        spec = self.registry.resolve("c/grok-build")
+
+        self.assertTrue(spec.is_console())
+        self.assertEqual(spec.console_model, "grok-build-0.1")
+        self.assertEqual(spec.public_name, "c/Grok Build")
+        self.assertEqual(
+            self.registry.resolve("grok-build-console").model_name,
+            "c/grok-build",
+        )
+
     def test_console_aliases_resolve_to_canonical_c_prefixed_models(self):
         self.assertEqual(
             self.registry.resolve("grok-4.3").model_name,
@@ -324,6 +335,7 @@ class ConsoleQuotaIsolationTests(unittest.TestCase):
             "c/grok-4.20-reasoning",
             "c/grok-4.20-non-reasoning",
             "c/grok-4.20-multi-agent",
+            "c/grok-build",
         ):
             with self.subTest(model_name=model_name):
                 spec = self.registry.resolve(model_name)

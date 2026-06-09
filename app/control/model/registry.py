@@ -51,6 +51,7 @@ MODELS: tuple[ModelSpec, ...] = (
     ModelSpec("c/grok-4.20-multi-agent-medium",         ModeId.CONSOLE, Tier.BASIC, Capability.CHAT,        True, "c/Grok 4.20 Multi-Agent Medium",        console_model="grok-4.20-multi-agent-0309",    default_reasoning_effort="medium"),
     ModelSpec("c/grok-4.20-multi-agent-high",           ModeId.CONSOLE, Tier.BASIC, Capability.CHAT,        True, "c/Grok 4.20 Multi-Agent High",          console_model="grok-4.20-multi-agent-0309",    default_reasoning_effort="high"),
     ModelSpec("c/grok-4.20-multi-agent-xhigh",          ModeId.CONSOLE, Tier.BASIC, Capability.CHAT,        True, "c/Grok 4.20 Multi-Agent XHigh",         console_model="grok-4.20-multi-agent-0309",    default_reasoning_effort="xhigh"),
+    ModelSpec("c/grok-build",                           ModeId.CONSOLE, Tier.BASIC, Capability.CHAT,        True, "c/Grok Build",                          console_model="grok-build-0.1"),
 
     # === Image ==============================================================
 
@@ -82,6 +83,7 @@ _ALIASES: dict[str, str] = {
     "grok-4.20-reasoning": "c/grok-4.20-reasoning",
     "grok-4.20-non-reasoning": "c/grok-4.20-non-reasoning",
     "grok-4.20-multi-agent": "c/grok-4.20-multi-agent",
+    "grok-build-console": "c/grok-build",
 }
 
 _BY_CAP: dict[int, list[ModelSpec]] = {}
