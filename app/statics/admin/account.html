@@ -1225,6 +1225,7 @@
 // ── State ──────────────────────────────────────────────────────────────────
 const PAGE_SIZE_KEY = 'admin.account.page_size';
 const PAGE_SIZE_OPTIONS = [50, 100, 200, 500, 1000, 2000];
+const ACCOUNT_AUTO_RELOAD_MS = 30000;
 
 let allTokens = [], curStatus = 'all', curNsfw = 'all', curPool = 'all', curPage = 1, pageSize = loadSavedPageSize();
 let curLayer = 'chat';
@@ -1236,6 +1237,8 @@ let _filterMenuBound = false;
 let _tokenViewVersion = 0;
 let _tokenViewCacheKey = '';
 let _tokenViewCache = null;
+let _accountLoadInFlight = false;
+let _accountAutoReloadTimer = null;
 
 function invalidateTokenView() {
   _tokenViewVersion += 1;
@@ -1295,7 +1298,8 @@ function waitI18n() {
   const key = await adminKey.get();
   if (!key || !await verifyKey(ADMIN_API + '/verify', key).catch(() => false))
     return location.href = '/admin/login';
-  load();
+  await load();
+  startAccountAutoReload();
 })();
 
 // ── API ────────────────────────────────────────────────────────────────────
@@ -1315,7 +1319,10 @@ async function _api(method, path, body) {
 let selectionStrategy = 'quota';
 
 // ── Load ───────────────────────────────────────────────────────────────────
-async function load() {
+async function load(options = {}) {
+  const silent = Boolean(options.silent);
+  if (_accountLoadInFlight) return;
+  _accountLoadInFlight = true;
   try {
     const [data, status] = await Promise.all([
       _api('GET', '/tokens'),
@@ -1331,7 +1338,28 @@ async function load() {
     applyStrategyUI();
     invalidateTokenView();
     render();
-  } catch (e) { showToast(`${tr('account.loadFailed', null, '加载失败')}: ${e.message}`, 'error'); }
+  } catch (e) {
+    if (!silent) showToast(`${tr('account.loadFailed', null, '加载失败')}: ${e.message}`, 'error');
+  } finally {
+    _accountLoadInFlight = false;
+  }
+}
+
+function shouldAutoReloadAccounts() {
+  if (document.hidden) return false;
+  if (_batchEs) return false;
+  if (refreshingTokens.size > 0) return false;
+  return true;
+}
+
+function startAccountAutoReload() {
+  if (_accountAutoReloadTimer) return;
+  _accountAutoReloadTimer = window.setInterval(() => {
+    if (shouldAutoReloadAccounts()) load({ silent: true });
+  }, ACCOUNT_AUTO_RELOAD_MS);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) load({ silent: true });
+  });
 }
 
 function applyStrategyUI() {
