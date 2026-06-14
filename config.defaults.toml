@@ -114,6 +114,11 @@ max_retries = 1
 on_codes = "429,401,503"
 
 
+[account]
+# 导入、新增或替换账户后，刷新检测成功再自动开启 NSFW；默认关闭，避免导入大量账号时自动打上游。
+auto_nsfw_on_import = false
+
+
 [account.refresh]
 # 总开关：true=配额刷新模式（主动探测，选号评分）；false=自动重试模式（随机选号，零探测）
 enabled = true

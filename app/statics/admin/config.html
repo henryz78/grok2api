@@ -453,6 +453,13 @@ const SCHEMA_DEF = [
         ]
       },
       {
+        title: '账户导入维护', titleKey: 'config.schema.groups.accountImportMaintenance',
+        section: 'account',
+        fields: [
+          { key: 'auto_nsfw_on_import', label: '导入后自动开启 NSFW', labelKey: 'config.schema.fields.autoNsfwOnImport.label', type: 'bool', desc: '开启后，导入、新增或替换账户池时会先刷新检测，只为正常/限流账户自动开启 NSFW。默认关闭，避免大量账号导入后自动请求上游。', descKey: 'config.schema.fields.autoNsfwOnImport.desc' },
+        ]
+      },
+      {
         title: '媒体返回格式', titleKey: 'config.schema.groups.mediaFormat',
         section: 'features',
         fields: [

@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from app.platform.config.snapshot import get_config
 from app.platform.errors import AppError, ErrorKind, UpstreamError, ValidationError
+from app.platform.logging.logger import logger
 from app.platform.runtime.batch import run_batch
 from app.platform.runtime.task import create_task, expire_task, get_task
 from app.control.account.commands import AccountPatch, ListAccountsQuery
@@ -60,6 +61,13 @@ async def _list_all_tokens(repo: "AccountRepository") -> list[str]:
             break
         page_num += 1
     return tokens
+
+
+async def _filter_manageable_tokens(repo: "AccountRepository", tokens: list[str]) -> list[str]:
+    unique_tokens = list(dict.fromkeys(tokens))
+    records = await repo.get_accounts(unique_tokens)
+    by_token = {r.token: r for r in records}
+    return [token for token in unique_tokens if (record := by_token.get(token)) and is_manageable(record)]
 
 
 def _json(data: Any, status_code: int = 200) -> Response:
@@ -215,20 +223,33 @@ async def _cache_clear_one(repo: "AccountRepository", token: str) -> dict:
 async def batch_nsfw(
     req: BatchRequest,
     async_mode: bool = Query(False, alias="async"),
+    all_manageable: bool = Query(False),
     concurrency: int | None = Query(None, ge=1),
     enabled: bool = Query(True),
     repo: "AccountRepository" = Depends(get_repo),
 ):
     tokens = [t.strip() for t in req.tokens if t.strip()]
-    if not tokens:
+    if all_manageable and tokens:
+        raise ValidationError("tokens must be empty when all_manageable=true", param="tokens")
+    if all_manageable:
         tokens = await _list_all_tokens(repo)
+    else:
+        if not tokens:
+            raise ValidationError("No tokens provided", param="tokens")
+        requested_count = len(tokens)
+        tokens = await _filter_manageable_tokens(repo, tokens)
+        skipped_count = requested_count - len(tokens)
+        if skipped_count:
+            logger.info("admin batch nsfw skipped non-manageable tokens: skipped_count={}", skipped_count)
     if not tokens:
-        raise ValidationError("No tokens available", param="tokens")
+        raise ValidationError("No manageable tokens available", param="tokens")
 
     async def _nsfw_and_tag(token: str) -> dict:
         return await _nsfw_one(repo, token, enabled)
 
     c = _concurrency(concurrency, "batch.nsfw_concurrency")
+    if all_manageable:
+        logger.info("admin batch nsfw all manageable: token_count={} concurrency={}", len(tokens), c)
     return await _dispatch(tokens, _nsfw_and_tag, use_async=async_mode, concurrency=c)
 
 
@@ -236,12 +257,26 @@ async def batch_nsfw(
 async def batch_refresh(
     req: BatchRequest,
     async_mode: bool = Query(False, alias="async"),
+    all_manageable: bool = Query(False),
     concurrency: int | None = Query(None, ge=1),
+    repo: "AccountRepository" = Depends(get_repo),
     refresh_svc: "AccountRefreshService" = Depends(get_refresh_svc),
 ):
     tokens = [t.strip() for t in req.tokens if t.strip()]
+    if all_manageable and tokens:
+        raise ValidationError("tokens must be empty when all_manageable=true", param="tokens")
+    if all_manageable:
+        tokens = await _list_all_tokens(repo)
+    else:
+        if not tokens:
+            raise ValidationError("No tokens provided", param="tokens")
+        requested_count = len(tokens)
+        tokens = await _filter_manageable_tokens(repo, tokens)
+        skipped_count = requested_count - len(tokens)
+        if skipped_count:
+            logger.info("admin batch refresh skipped non-manageable tokens: skipped_count={}", skipped_count)
     if not tokens:
-        raise ValidationError("No tokens provided", param="tokens")
+        raise ValidationError("No manageable tokens available", param="tokens")
 
     async def _refresh_one(token: str) -> dict:
         result = await refresh_svc.refresh_tokens([token])
@@ -250,6 +285,8 @@ async def batch_refresh(
         return {"refreshed": result.refreshed}
 
     c = _concurrency(concurrency, "batch.refresh_concurrency")
+    if all_manageable:
+        logger.info("admin batch refresh all manageable: token_count={} concurrency={}", len(tokens), c)
     return await _dispatch(tokens, _refresh_one, use_async=async_mode, concurrency=c)
 
 

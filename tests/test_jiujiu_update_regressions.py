@@ -58,6 +58,48 @@ def _install_common_stubs() -> None:
         sys.modules["curl_cffi"] = curl_cffi
         sys.modules["curl_cffi.const"] = curl_const
 
+    fastapi = sys.modules.get("fastapi") or types.ModuleType("fastapi")
+
+    class _APIRouter:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get(self, *args, **kwargs):
+            return lambda fn: fn
+
+        def post(self, *args, **kwargs):
+            return lambda fn: fn
+
+        def put(self, *args, **kwargs):
+            return lambda fn: fn
+
+        def delete(self, *args, **kwargs):
+            return lambda fn: fn
+
+    if not hasattr(fastapi, "APIRouter"):
+        fastapi.APIRouter = _APIRouter
+    if not hasattr(fastapi, "Body"):
+        fastapi.Body = lambda default=None, *args, **kwargs: default
+    if not hasattr(fastapi, "Depends"):
+        fastapi.Depends = lambda dependency=None, *args, **kwargs: dependency
+    if not hasattr(fastapi, "Query"):
+        fastapi.Query = lambda default=None, *args, **kwargs: default
+    sys.modules["fastapi"] = fastapi
+
+    responses = sys.modules.get("fastapi.responses") or types.ModuleType("fastapi.responses")
+
+    class _Response:
+        def __init__(self, content=b"", media_type=None, status_code=200):
+            self.body = content if isinstance(content, bytes) else str(content).encode("utf-8")
+            self.media_type = media_type
+            self.status_code = status_code
+
+    if not hasattr(responses, "Response"):
+        responses.Response = _Response
+    if not hasattr(responses, "StreamingResponse"):
+        responses.StreamingResponse = _Response
+    sys.modules["fastapi.responses"] = responses
+
 
 def _purge_modules(prefixes: tuple[str, ...]) -> None:
     for name in list(sys.modules):
@@ -82,6 +124,31 @@ def _load_openai_chat_module():
     spec = importlib.util.spec_from_file_location(
         "app.products.openai.chat",
         REPO_ROOT / "app" / "products" / "openai" / "chat.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_admin_tokens_module():
+    _install_common_stubs()
+    _purge_modules(("app.products.web",))
+
+    _ensure_package("app", REPO_ROOT / "app")
+    _ensure_package("app.products", REPO_ROOT / "app" / "products")
+    _ensure_package("app.products.web", REPO_ROOT / "app" / "products" / "web")
+
+    admin_pkg = types.ModuleType("app.products.web.admin")
+    admin_pkg.__path__ = [str(REPO_ROOT / "app" / "products" / "web" / "admin")]
+    admin_pkg.get_refresh_svc = lambda *args, **kwargs: None
+    admin_pkg.get_repo = lambda *args, **kwargs: None
+    sys.modules["app.products.web.admin"] = admin_pkg
+
+    spec = importlib.util.spec_from_file_location(
+        "app.products.web.admin.tokens",
+        REPO_ROOT / "app" / "products" / "web" / "admin" / "tokens.py",
     )
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -394,3 +461,62 @@ class StableJiujiuUpdateTests(unittest.TestCase):
         self.assertGreaterEqual(chat.count('yield ": heartbeat\\n\\n"'), 2)
         self.assertGreaterEqual(responses.count('yield ": heartbeat\\n\\n"'), 2)
         self.assertGreaterEqual(messages.count('yield ": heartbeat\\n\\n"'), 2)
+
+    def test_admin_batch_all_manageable_must_be_explicit(self):
+        source = (REPO_ROOT / "app" / "products" / "web" / "admin" / "batch.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("all_manageable: bool = Query(False)", source)
+        self.assertIn('raise ValidationError("No tokens provided", param="tokens")', source)
+        self.assertIn('raise ValidationError("tokens must be empty when all_manageable=true"', source)
+        self.assertIn("await _filter_manageable_tokens(repo, tokens)", source)
+
+    def test_delete_invalid_endpoint_only_deletes_expired_accounts(self):
+        tokens_mod = _load_admin_tokens_module()
+        enums = importlib.import_module("app.control.account.enums")
+
+        class _Record:
+            def __init__(self, token, status):
+                self.token = token
+                self.status = status
+
+        class _Repo:
+            def __init__(self):
+                self.deleted = []
+
+            async def list_accounts(self, _query):
+                return types.SimpleNamespace(
+                    items=[
+                        _Record("tok-active", enums.AccountStatus.ACTIVE),
+                        _Record("tok-cooling", enums.AccountStatus.COOLING),
+                        _Record("tok-disabled", enums.AccountStatus.DISABLED),
+                        _Record("tok-expired", enums.AccountStatus.EXPIRED),
+                    ],
+                    total_pages=1,
+                )
+
+            async def delete_accounts(self, tokens):
+                self.deleted = list(tokens)
+
+        repo = _Repo()
+        response = asyncio.run(tokens_mod.delete_invalid_tokens(repo))
+        body = json.loads(response.body.decode("utf-8"))
+
+        self.assertEqual(repo.deleted, ["tok-expired"])
+        self.assertEqual(body, {"deleted": 1})
+
+    def test_account_admin_safe_bulk_controls_are_present(self):
+        account = (REPO_ROOT / "app" / "statics" / "admin" / "account.html").read_text(encoding="utf-8")
+        config = (REPO_ROOT / "app" / "statics" / "admin" / "config.html").read_text(encoding="utf-8")
+        defaults = (REPO_ROOT / "config.defaults.toml").read_text(encoding="utf-8")
+
+        self.assertIn("id=\"import-auto-nsfw\"", account)
+        self.assertIn("id=\"import-file-auto-nsfw\"", account)
+        self.assertIn("/batch/refresh?all_manageable=true", account)
+        self.assertIn("/batch/nsfw?all_manageable=true", account)
+        self.assertIn("window.prompt", account)
+        self.assertIn("DELETE", account)
+        self.assertIn("isDeletableInvalidStatus(status)", account)
+        self.assertIn("auto_nsfw_on_import", config)
+        self.assertIn("auto_nsfw_on_import = false", defaults)

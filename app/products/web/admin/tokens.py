@@ -12,11 +12,12 @@ import re
 from typing import TYPE_CHECKING
 
 import orjson
-from fastapi import APIRouter, Body, Depends
+from fastapi import APIRouter, Body, Depends, Query
 from fastapi.responses import Response
 from pydantic import BaseModel, RootModel
 
 from app.platform.errors import AppError, ErrorKind, ValidationError
+from app.platform.config.snapshot import get_config
 from app.platform.logging.logger import logger
 from app.platform.runtime.clock import now_ms
 from app.control.account.commands import (
@@ -26,6 +27,7 @@ from app.control.account.commands import (
     ListAccountsQuery,
 )
 from app.control.account.enums import AccountStatus
+from app.control.account.state_machine import is_manageable
 
 if TYPE_CHECKING:
     from app.control.account.refresh import AccountRefreshService
@@ -34,6 +36,7 @@ if TYPE_CHECKING:
 from . import get_refresh_svc, get_repo
 
 router = APIRouter(tags=["Admin - Tokens"])
+_background_tasks: set[asyncio.Task] = set()
 
 # ---------------------------------------------------------------------------
 # Token sanitisation
@@ -141,6 +144,41 @@ def _json(data) -> Response:
     return Response(content=orjson.dumps(data), media_type="application/json")
 
 
+def _auto_nsfw_on_import_enabled() -> bool:
+    return get_config().get_bool("account.auto_nsfw_on_import", False)
+
+
+def _resolve_auto_nsfw(override: bool | None) -> bool:
+    return _auto_nsfw_on_import_enabled() if override is None else bool(override)
+
+
+def _fire_and_forget(coro) -> asyncio.Task:
+    # Keep a strong reference so import maintenance tasks cannot disappear before completion.
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+
+    def _cleanup(done: asyncio.Task) -> None:
+        _background_tasks.discard(done)
+        if done.cancelled():
+            return
+        if exc := done.exception():
+            logger.warning("admin background task failed: error_type={}", type(exc).__name__)
+
+    task.add_done_callback(_cleanup)
+    return task
+
+
+def _schedule_import_auto_nsfw(
+    repo: "AccountRepository",
+    tokens: list[str],
+    *,
+    enabled: bool,
+) -> None:
+    if not tokens or not enabled:
+        return
+    _fire_and_forget(_enable_nsfw_imported(repo, list(dict.fromkeys(tokens))))
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -153,7 +191,7 @@ async def list_tokens(repo: "AccountRepository" = Depends(get_repo)):
     while True:
         page = await repo.list_accounts(ListAccountsQuery(page=page_num, page_size=2000))
         all_items.extend(page.items)
-        if page_num * 2000 >= page.total:
+        if page_num >= page.total_pages or not page.items:
             break
         page_num += 1
 
@@ -163,6 +201,7 @@ async def list_tokens(repo: "AccountRepository" = Depends(get_repo)):
 @router.post("/tokens")
 async def save_tokens(
     req: SaveTokensRequest,
+    auto_nsfw: bool | None = Query(None),
     repo: "AccountRepository" = Depends(get_repo),
     refresh_svc: "AccountRefreshService" = Depends(get_refresh_svc),
 ):
@@ -185,13 +224,19 @@ async def save_tokens(
 
     logger.info("admin tokens saved across pools: saved_count={}", total_upserted)
     if all_tokens:
-        asyncio.create_task(_refresh_imported(refresh_svc, all_tokens))
+        _fire_and_forget(_refresh_then_auto_nsfw(
+            refresh_svc,
+            repo,
+            all_tokens,
+            auto_nsfw_enabled=_resolve_auto_nsfw(auto_nsfw),
+        ))
     return _json({"status": "success", "count": total_upserted})
 
 
 @router.post("/tokens/add")
 async def add_tokens(
     req: AddTokensRequest,
+    auto_nsfw: bool | None = Query(None),
     repo: "AccountRepository" = Depends(get_repo),
     refresh_svc: "AccountRefreshService" = Depends(get_refresh_svc),
 ):
@@ -226,17 +271,27 @@ async def add_tokens(
         len(existing),
     )
 
+    auto_nsfw_enabled = _resolve_auto_nsfw(auto_nsfw)
     if sync_auto_detect:
+        refresh_ok = False
         try:
             refresh_result = await refresh_svc.refresh_on_import(new_tokens)
+            refresh_ok = True
             logger.info(
                 "admin auto-detect quota sync completed: token_count={} refreshed={} failed={}",
                 len(new_tokens), refresh_result.refreshed, refresh_result.failed,
             )
         except Exception as exc:
             logger.warning("admin auto-detect quota sync failed: token_count={} error={}", len(new_tokens), exc)
+        if refresh_ok:
+            _schedule_import_auto_nsfw(repo, new_tokens, enabled=auto_nsfw_enabled)
     else:
-        asyncio.create_task(_refresh_imported(refresh_svc, new_tokens))
+        _fire_and_forget(_refresh_then_auto_nsfw(
+            refresh_svc,
+            repo,
+            new_tokens,
+            auto_nsfw_enabled=auto_nsfw_enabled,
+        ))
 
     return _json({
         "status": "success",
@@ -257,6 +312,26 @@ async def delete_tokens(
     await repo.delete_accounts(cleaned)
     logger.info("admin tokens deleted: deleted_count={}", len(cleaned))
     return _json({"deleted": len(cleaned)})
+
+
+@router.delete("/tokens/invalid")
+async def delete_invalid_tokens(repo: "AccountRepository" = Depends(get_repo)):
+    """Delete only explicitly expired accounts; cooling/disabled accounts are preserved."""
+    tokens: list[str] = []
+    page_num = 1
+    while True:
+        page = await repo.list_accounts(ListAccountsQuery(page=page_num, page_size=2000))
+        tokens.extend(r.token for r in page.items if r.status == AccountStatus.EXPIRED)
+        if page_num >= page.total_pages or not page.items:
+            break
+        page_num += 1
+
+    if not tokens:
+        return _json({"deleted": 0})
+
+    await repo.delete_accounts(tokens)
+    logger.info("admin invalid tokens deleted: deleted_count={}", len(tokens))
+    return _json({"deleted": len(tokens)})
 
 
 @router.put("/tokens/edit")
@@ -438,6 +513,7 @@ async def toggle_tokens_disabled(
 @router.put("/tokens/pool")
 async def replace_pool(
     req: ReplacePoolRequest,
+    auto_nsfw: bool | None = Query(None),
     repo: "AccountRepository" = Depends(get_repo),
     refresh_svc: "AccountRefreshService" = Depends(get_refresh_svc),
 ):
@@ -446,7 +522,12 @@ async def replace_pool(
     await repo.replace_pool(BulkReplacePoolCommand(pool=req.pool, upserts=upserts))
     logger.info("admin pool replaced: pool={} token_count={}", req.pool, len(cleaned))
     if cleaned:
-        asyncio.create_task(_refresh_imported(refresh_svc, cleaned))
+        _fire_and_forget(_refresh_then_auto_nsfw(
+            refresh_svc,
+            repo,
+            cleaned,
+            auto_nsfw_enabled=_resolve_auto_nsfw(auto_nsfw),
+        ))
     return _json({"pool": req.pool, "count": len(cleaned)})
 
 
@@ -454,9 +535,60 @@ async def replace_pool(
 # Fire-and-forget import refresh
 # ---------------------------------------------------------------------------
 
-async def _refresh_imported(svc: "AccountRefreshService", tokens: list[str]) -> None:
+async def _refresh_imported(svc: "AccountRefreshService", tokens: list[str]) -> bool:
     try:
         await svc.refresh_on_import(tokens)
         logger.info("admin import quota sync completed: token_count={}", len(tokens))
+        return True
     except Exception as exc:
         logger.warning("admin import quota sync failed: token_count={} error={}", len(tokens), exc)
+        return False
+
+
+async def _refresh_then_auto_nsfw(
+    svc: "AccountRefreshService",
+    repo: "AccountRepository",
+    tokens: list[str],
+    *,
+    auto_nsfw_enabled: bool,
+) -> None:
+    unique_tokens = list(dict.fromkeys(tokens))
+    if await _refresh_imported(svc, unique_tokens):
+        _schedule_import_auto_nsfw(repo, unique_tokens, enabled=auto_nsfw_enabled)
+
+
+async def _enable_nsfw_imported(repo: "AccountRepository", tokens: list[str]) -> None:
+    from app.platform.runtime.batch import run_batch
+    from app.products.web.admin.batch import _concurrency, _nsfw_one
+
+    records = await repo.get_accounts(tokens)
+    by_token = {r.token: r for r in records}
+    manageable_tokens = [token for token in tokens if (record := by_token.get(token)) and is_manageable(record)]
+    skipped_count = len(tokens) - len(manageable_tokens)
+    if not manageable_tokens:
+        logger.info(
+            "admin import auto nsfw skipped: token_count={} skipped_non_manageable={}",
+            len(tokens),
+            skipped_count,
+        )
+        return
+
+    ok_count = fail_count = 0
+
+    async def _one(token: str) -> None:
+        nonlocal ok_count, fail_count
+        try:
+            await _nsfw_one(repo, token, True)
+            ok_count += 1
+        except Exception as exc:
+            fail_count += 1
+            logger.warning("admin import auto nsfw failed: token={} error={}", _mask(token), exc)
+
+    await run_batch(manageable_tokens, _one, concurrency=_concurrency(None, "batch.nsfw_concurrency"))
+    logger.info(
+        "admin import auto nsfw completed: token_count={} skipped_non_manageable={} ok={} failed={}",
+        len(manageable_tokens),
+        skipped_count,
+        ok_count,
+        fail_count,
+    )
