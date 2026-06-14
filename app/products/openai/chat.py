@@ -665,6 +665,7 @@ async def _console_completions(
 
                 try:
                     try:
+                        yield ": heartbeat\n\n"
                         session, response = await _console_post(
                             token=token,
                             console_model=console_model,
@@ -1064,6 +1065,7 @@ async def completions(
                         ended = False
                         sieve = ToolSieve(tool_names)
                         tool_calls_emitted = False
+                        yield ": heartbeat\n\n"
                         async for line in _stream_chat(
                                 token=token,
                                 mode_id=ModeId(selected_mode_id),

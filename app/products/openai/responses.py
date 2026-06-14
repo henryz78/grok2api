@@ -320,6 +320,7 @@ async def _console_responses_dispatch(
 
                 try:
                     try:
+                        yield ": heartbeat\n\n"
                         session, response = await _console_post(
                             token=token,
                             console_model=console_model,
@@ -629,6 +630,7 @@ async def create(
                         })
 
                     ended = False
+                    yield ": heartbeat\n\n"
                     async for line in _stream_chat(
                             token=token,
                             mode_id=ModeId(selected_mode_id),

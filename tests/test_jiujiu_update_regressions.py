@@ -325,3 +325,72 @@ class ConsoleQuotaSyncTests(unittest.TestCase):
         asyncio.run(_run())
 
         self.assertEqual(calls, [("tok-console", 5)])
+
+
+class StableJiujiuUpdateTests(unittest.TestCase):
+    def test_run_batch_uses_worker_pool_and_preserves_order(self):
+        runtime_batch = importlib.import_module("app.platform.runtime.batch")
+        active = 0
+        max_active = 0
+        lock = asyncio.Lock()
+
+        async def _handler(item):
+            nonlocal active, max_active
+            async with lock:
+                active += 1
+                max_active = max(max_active, active)
+            await asyncio.sleep(0)
+            async with lock:
+                active -= 1
+            return item * 2
+
+        async def _run():
+            return await runtime_batch.run_batch(range(12), _handler, concurrency=3)
+
+        result = asyncio.run(_run())
+
+        self.assertEqual(result, [i * 2 for i in range(12)])
+        self.assertLessEqual(max_active, 3)
+
+        source = (REPO_ROOT / "app" / "platform" / "runtime" / "batch.py").read_text(encoding="utf-8")
+        self.assertIn("asyncio.create_task(_worker())", source)
+        self.assertNotIn("asyncio.gather(*[_guarded", source)
+
+    def test_admin_batch_async_path_uses_shared_batch_runner(self):
+        source = (REPO_ROOT / "app" / "products" / "web" / "admin" / "batch.py").read_text(encoding="utf-8")
+
+        self.assertIn("_MAX_BATCH_CONCURRENCY = 50", source)
+        self.assertIn("await run_batch(tokens, _one, concurrency=concurrency)", source)
+        self.assertNotIn("await asyncio.gather(*[_one(t) for t in tokens])", source)
+
+    def test_redis_get_accounts_uses_pipeline(self):
+        source = (REPO_ROOT / "app" / "control" / "account" / "backends" / "redis.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("async with self._r.pipeline() as pipe", source)
+        self.assertIn("hashes = await pipe.execute()", source)
+        self.assertIn("for token, h in zip(tokens, hashes, strict=True):", source)
+
+    def test_config_number_input_honors_min_max(self):
+        source = (REPO_ROOT / "app" / "statics" / "admin" / "config.html").read_text(encoding="utf-8")
+
+        self.assertIn("if (field.min != null) attrs.min = field.min;", source)
+        self.assertIn("if (field.max != null) attrs.max = field.max;", source)
+        self.assertIn("if (field.min != null && n < field.min) n = field.min;", source)
+        self.assertIn("if (field.max != null && n > field.max) n = field.max;", source)
+        self.assertIn("key: 'refresh_concurrency', label: '刷新 Usage 并发数'", source)
+        self.assertIn("type: 'number', min: 1, max: 50", source)
+
+    def test_streaming_routes_emit_sse_heartbeats(self):
+        chat = (REPO_ROOT / "app" / "products" / "openai" / "chat.py").read_text(encoding="utf-8")
+        responses = (REPO_ROOT / "app" / "products" / "openai" / "responses.py").read_text(
+            encoding="utf-8"
+        )
+        messages = (REPO_ROOT / "app" / "products" / "anthropic" / "messages.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertGreaterEqual(chat.count('yield ": heartbeat\\n\\n"'), 2)
+        self.assertGreaterEqual(responses.count('yield ": heartbeat\\n\\n"'), 2)
+        self.assertGreaterEqual(messages.count('yield ": heartbeat\\n\\n"'), 2)

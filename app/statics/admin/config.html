@@ -509,7 +509,7 @@ const SCHEMA_DEF = [
           { key: 'super_interval_sec', label: 'Super 周期（秒）', labelKey: 'config.schema.fields.superInterval.label', type: 'number', desc: 'super 号池共用周期：quota 模式下用于后台刷新，random 模式下用于 429 冷却。默认 7200s。', descKey: 'config.schema.fields.superInterval.desc' },
           { key: 'heavy_interval_sec', label: 'Heavy 周期（秒）', labelKey: 'config.schema.fields.heavyInterval.label', type: 'number', desc: 'heavy 号池共用周期：quota 模式下用于后台刷新，random 模式下用于 429 冷却。默认 7200s。', descKey: 'config.schema.fields.heavyInterval.desc' },
           { key: 'on_demand_min_interval_sec', label: '按需刷新间隔（秒）', labelKey: 'config.schema.fields.onDemandMinInterval.label', type: 'number', desc: '请求链路触发刷新（例如收到 429）时的节流间隔。N 秒内重复触发只执行一次，避免批量打爆配额接口。', descKey: 'config.schema.fields.onDemandMinInterval.desc' },
-          { key: 'usage_concurrency', label: '刷新并发数', labelKey: 'config.schema.fields.usageConcurrency.label', type: 'number', desc: '并发调用 usage 接口刷新额度时允许的最大并行数。', descKey: 'config.schema.fields.usageConcurrency.desc' },
+          { key: 'usage_concurrency', label: '刷新并发数', labelKey: 'config.schema.fields.usageConcurrency.label', type: 'number', min: 1, max: 50, desc: '并发调用 usage 接口刷新额度时允许的最大并行数。', descKey: 'config.schema.fields.usageConcurrency.desc' },
         ]
       },
       {
@@ -523,11 +523,11 @@ const SCHEMA_DEF = [
         title: '批量操作并发', titleKey: 'config.schema.groups.batchConcurrency',
         section: 'batch',
         fields: [
-          { key: 'nsfw_concurrency', label: '开启 NSFW 并发数', labelKey: 'config.schema.fields.nsfwConcurrency.label', type: 'number', desc: '批量开启 NSFW 时的 token 级并发数；每个 token 需经历三步网络请求。', descKey: 'config.schema.fields.nsfwConcurrency.desc' },
-          { key: 'refresh_concurrency', label: '刷新 Usage 并发数', labelKey: 'config.schema.fields.refreshConcurrency.label', type: 'number', desc: '批量刷新账户额度时的 token 级并发数。', descKey: 'config.schema.fields.refreshConcurrency.desc' },
-          { key: 'asset_upload_concurrency', label: '上传 Asset 并发数', labelKey: 'config.schema.fields.assetUploadConcurrency.label', type: 'number', desc: 'API 接收文件附件后触发的 Asset 上传任务，全局最大并发数，跨所有请求共享。', descKey: 'config.schema.fields.assetUploadConcurrency.desc' },
-          { key: 'asset_list_concurrency', label: '查询 Asset 并发数', labelKey: 'config.schema.fields.assetListConcurrency.label', type: 'number', desc: 'list_assets 接口的全局最大并发数，跨所有请求共享。', descKey: 'config.schema.fields.assetListConcurrency.desc' },
-          { key: 'asset_delete_concurrency', label: '删除 Asset 并发数', labelKey: 'config.schema.fields.assetDeleteConcurrency.label', type: 'number', desc: 'delete_asset 接口的全局最大并发数，同时作为管理后台批量清理的 token 级默认并发值。', descKey: 'config.schema.fields.assetDeleteConcurrency.desc' },
+          { key: 'nsfw_concurrency', label: '开启 NSFW 并发数', labelKey: 'config.schema.fields.nsfwConcurrency.label', type: 'number', min: 1, max: 50, desc: '批量开启 NSFW 时的 token 级并发数；每个 token 需经历三步网络请求。', descKey: 'config.schema.fields.nsfwConcurrency.desc' },
+          { key: 'refresh_concurrency', label: '刷新 Usage 并发数', labelKey: 'config.schema.fields.refreshConcurrency.label', type: 'number', min: 1, max: 50, desc: '批量刷新账户额度时的 token 级并发数。', descKey: 'config.schema.fields.refreshConcurrency.desc' },
+          { key: 'asset_upload_concurrency', label: '上传 Asset 并发数', labelKey: 'config.schema.fields.assetUploadConcurrency.label', type: 'number', min: 1, max: 50, desc: 'API 接收文件附件后触发的 Asset 上传任务，全局最大并发数，跨所有请求共享。', descKey: 'config.schema.fields.assetUploadConcurrency.desc' },
+          { key: 'asset_list_concurrency', label: '查询 Asset 并发数', labelKey: 'config.schema.fields.assetListConcurrency.label', type: 'number', min: 1, max: 50, desc: 'list_assets 接口的全局最大并发数，跨所有请求共享。', descKey: 'config.schema.fields.assetListConcurrency.desc' },
+          { key: 'asset_delete_concurrency', label: '删除 Asset 并发数', labelKey: 'config.schema.fields.assetDeleteConcurrency.label', type: 'number', min: 1, max: 50, desc: 'delete_asset 接口的全局最大并发数，同时作为管理后台批量清理的 token 级默认并发值。', descKey: 'config.schema.fields.assetDeleteConcurrency.desc' },
         ]
       },
     ]
@@ -1060,10 +1060,18 @@ function renderInput(field, section, value) {
   }
 
   if (field.type === 'number') {
-    const inp = _el('input', { class: 'cfg-number', type: 'number',
-      id: `field-${section}-${field.key}`, value: value ?? '' });
+    const attrs = { class: 'cfg-number', type: 'number',
+      id: `field-${section}-${field.key}`, value: value ?? '' };
+    if (field.min != null) attrs.min = field.min;
+    if (field.max != null) attrs.max = field.max;
+    const inp = _el('input', attrs);
     inp.addEventListener('input', () => {
-      const n = inp.value === '' ? '' : Number(inp.value);
+      let n = inp.value === '' ? '' : Number(inp.value);
+      if (typeof n === 'number' && !isNaN(n)) {
+        if (field.min != null && n < field.min) n = field.min;
+        if (field.max != null && n > field.max) n = field.max;
+        if (inp.value !== String(n)) inp.value = n;
+      }
       onChange(n);
     });
     return inp;

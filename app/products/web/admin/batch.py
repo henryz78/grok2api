@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 from . import get_refresh_svc, get_repo
 
 router = APIRouter(prefix="/batch", tags=["Admin - Batch"])
+_MAX_BATCH_CONCURRENCY = 50
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -37,9 +38,13 @@ router = APIRouter(prefix="/batch", tags=["Admin - Batch"])
 def _concurrency(override: int | None, config_key: str, fallback: int = 50) -> int:
     """Resolve effective concurrency: query-param → config → fallback."""
     if override is not None:
-        return max(1, override)
+        return min(max(1, override), _MAX_BATCH_CONCURRENCY)
     v = get_config(config_key, fallback)
-    return max(1, int(v))
+    try:
+        resolved = int(v)
+    except (TypeError, ValueError):
+        resolved = fallback
+    return min(max(1, resolved), _MAX_BATCH_CONCURRENCY)
 
 
 def _mask(token: str) -> str:
@@ -51,7 +56,7 @@ async def _list_all_tokens(repo: "AccountRepository") -> list[str]:
     while True:
         page = await repo.list_accounts(ListAccountsQuery(page=page_num, page_size=2000))
         tokens.extend(r.token for r in page.items if is_manageable(r))
-        if page_num * 2000 >= page.total:
+        if page_num >= page.total_pages or not page.items:
             break
         page_num += 1
     return tokens
@@ -124,7 +129,6 @@ async def _dispatch_async(
 
     async def _run() -> None:
         try:
-            sem = asyncio.Semaphore(concurrency)
             results: dict[str, Any] = {}
             ok_c = fail_c = 0
 
@@ -132,23 +136,18 @@ async def _dispatch_async(
                 nonlocal ok_c, fail_c
                 if task.cancelled:
                     return
-                async with sem:
-                    # Re-check after acquiring slot: cancel may have been set
-                    # while this coroutine was waiting for a semaphore slot.
-                    if task.cancelled:
-                        return
-                    masked = _mask(token)
-                    try:
-                        data = await handler(token)
-                        ok_c += 1
-                        results[masked] = data
-                        task.record(True, item=masked, detail=data)
-                    except Exception as exc:
-                        fail_c += 1
-                        results[masked] = {"error": str(exc)}
-                        task.record(False, item=masked, error=str(exc))
+                masked = _mask(token)
+                try:
+                    data = await handler(token)
+                    ok_c += 1
+                    results[masked] = data
+                    task.record(True, item=masked, detail=data)
+                except Exception as exc:
+                    fail_c += 1
+                    results[masked] = {"error": str(exc)}
+                    task.record(False, item=masked, error=str(exc))
 
-            await asyncio.gather(*[_one(t) for t in tokens])
+            await run_batch(tokens, _one, concurrency=concurrency)
 
             if task.cancelled:
                 task.finish_cancelled()
