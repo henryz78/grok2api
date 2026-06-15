@@ -43,7 +43,7 @@ def _w(remaining: int, total: int, window_seconds: int) -> QuotaWindow:
 BASIC_FAST_LIMIT = 30
 BASIC_FAST_WINDOW_SECONDS = 86_400
 BASIC_CONSOLE_LIMIT = 30
-BASIC_CONSOLE_WINDOW_SECONDS = 900
+BASIC_CONSOLE_WINDOW_SECONDS = 1_800
 
 BASIC_QUOTA_DEFAULTS = AccountQuotaSet(
     auto=_w(0, 0, 0),  # unsupported on basic accounts

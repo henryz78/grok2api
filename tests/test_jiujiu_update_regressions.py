@@ -274,7 +274,7 @@ class AccountRefreshBootstrapTests(unittest.TestCase):
         restored = self.models.QuotaWindow.from_dict(patches[0].quota_console)
         self.assertEqual(restored.remaining, 30)
         self.assertEqual(restored.total, 30)
-        self.assertEqual(restored.window_seconds, 900)
+        self.assertEqual(restored.window_seconds, 1_800)
 
     def test_refresh_call_async_console_deducts_locally_without_upstream_fetch(self):
         patches = []
@@ -313,11 +313,11 @@ class AccountRefreshBootstrapTests(unittest.TestCase):
         self.assertEqual(patched.usage_use_delta, 1)
         self.assertIsNone(patched.usage_sync_delta)
 
-    def test_console_local_deduct_starts_reset_timer_at_half_quota(self):
+    def test_console_local_deduct_starts_reset_timer_at_rotation_threshold(self):
         patches = []
         quota_set = self.quota_defaults.default_quota_set("basic")
         assert quota_set.console is not None
-        quota_set.console.remaining = 16
+        quota_set.console.remaining = 21
         quota_set.console.reset_at = None
         record = self.models.AccountRecord(
             token="tok-console-threshold",
@@ -336,9 +336,9 @@ class AccountRefreshBootstrapTests(unittest.TestCase):
         asyncio.run(_run())
 
         window = self.models.QuotaWindow.from_dict(patches[0].quota_console)
-        self.assertEqual(window.remaining, 15)
+        self.assertEqual(window.remaining, 20)
         self.assertIsNotNone(window.reset_at)
-        self.assertEqual(window.window_seconds, 900)
+        self.assertEqual(window.window_seconds, 1_800)
 
     def test_console_local_deduct_resets_expired_window_before_counting_call(self):
         patches = []
