@@ -241,7 +241,6 @@ async def add_tokens(
     refresh_svc: "AccountRefreshService" = Depends(get_refresh_svc),
 ):
     requested_pool = (req.pool or "basic").strip().lower()
-    sync_auto_detect = requested_pool == "auto"
 
     # Deduplicate and sanitize input
     cleaned: list[str] = []
@@ -272,32 +271,17 @@ async def add_tokens(
     )
 
     auto_nsfw_enabled = _resolve_auto_nsfw(auto_nsfw)
-    if sync_auto_detect:
-        refresh_ok = False
-        try:
-            refresh_result = await refresh_svc.refresh_on_import(new_tokens)
-            refresh_ok = True
-            logger.info(
-                "admin auto-detect quota sync completed: token_count={} refreshed={} failed={}",
-                len(new_tokens), refresh_result.refreshed, refresh_result.failed,
-            )
-        except Exception as exc:
-            logger.warning("admin auto-detect quota sync failed: token_count={} error={}", len(new_tokens), exc)
-        if refresh_ok:
-            _schedule_import_auto_nsfw(repo, new_tokens, enabled=auto_nsfw_enabled)
-    else:
-        _fire_and_forget(_refresh_then_auto_nsfw(
-            refresh_svc,
-            repo,
-            new_tokens,
-            auto_nsfw_enabled=auto_nsfw_enabled,
-        ))
+    _fire_and_forget(_refresh_then_auto_nsfw(
+        refresh_svc,
+        repo,
+        new_tokens,
+        auto_nsfw_enabled=auto_nsfw_enabled,
+    ))
 
     return _json({
         "status": "success",
         "count": result.upserted or len(new_tokens),
         "skipped": len(existing),
-        "synced": sync_auto_detect,
     })
 
 

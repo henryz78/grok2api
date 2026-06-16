@@ -524,3 +524,19 @@ class StableJiujiuUpdateTests(unittest.TestCase):
         self.assertIn("if (_batchEs) return false;", account)
         self.assertIn("auto_nsfw_on_import", config)
         self.assertIn("auto_nsfw_on_import = false", defaults)
+
+    def test_auto_pool_import_refreshes_in_background(self):
+        source = (REPO_ROOT / "app" / "products" / "web" / "admin" / "tokens.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertNotIn("sync_auto_detect", source)
+        self.assertNotIn("admin auto-detect quota sync completed", source)
+        self.assertIn("_fire_and_forget(_refresh_then_auto_nsfw(", source)
+
+    def test_security_dependency_floors_are_updated(self):
+        source = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+        self.assertIn('"cryptography>=48.0.1"', source)
+        self.assertIn('"python-multipart>=0.0.31"', source)
+        self.assertIn('"starlette>=1.1.0"', source)
