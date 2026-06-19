@@ -67,6 +67,27 @@ _TOOL_EMOJI = {
     "x_search": "🔍",
 }
 _MULTI_AGENT_CONSOLE_MODEL = "grok-4.20-multi-agent-0309"
+_CONSOLE_INTERNAL_TOOL_NAMES: frozenset[str] = frozenset({
+    "web_search",
+    "x_search",
+    "code_interpreter",
+    "file_search",
+    "web_search_with_snippets",
+    "browse_page",
+    "open_page",
+    "open_page_with_find",
+    "search_images",
+    "image_search",
+    "view_image",
+    "x_user_search",
+    "x_keyword_search",
+    "x_semantic_search",
+    "x_thread_fetch",
+    "view_x_video",
+    "chatroom_send",
+    "code_execution",
+    "collections_search",
+})
 
 # ---------------------------------------------------------------------------
 # Input conversion (OpenAI Chat Completions → console.x.ai input array)
@@ -234,6 +255,24 @@ def _convert_content_blocks(
 # ---------------------------------------------------------------------------
 
 
+def _is_console_internal_tool_name(name: str) -> bool:
+    return name.strip() in _CONSOLE_INTERNAL_TOOL_NAMES
+
+
+def client_function_tool_names(tools: list[dict[str, Any]] | None) -> set[str]:
+    """Return client-declared function names that may become tool_calls."""
+    names: set[str] = set()
+    for tool in tools or []:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else None
+        src = fn if fn is not None else tool
+        name = str(src.get("name") or "").strip()
+        if name and not _is_console_internal_tool_name(name):
+            names.add(name)
+    return names
+
+
 def convert_openai_tools_to_console(tools: list[dict[str, Any]] | None, ) -> list[dict[str, Any]]:
     """Convert OpenAI Chat Completions tools → console (Responses API) tools.
 
@@ -257,17 +296,22 @@ def convert_openai_tools_to_console(tools: list[dict[str, Any]] | None, ) -> lis
             out.append(dict(t))
             continue
         fn = t.get("function") if isinstance(t.get("function"), dict) else None
-        if fn is not None:
-            out.append(
-                {
-                    "type": "function",
-                    "name": fn.get("name") or "",
-                    "description": fn.get("description") or "",
-                    "parameters": fn.get("parameters") or {},
-                })
-        else:
-            # Already flat
-            out.append(dict(t))
+        src = fn if fn is not None else t
+        name = str(src.get("name") or "").strip()
+        if not name or _is_console_internal_tool_name(name):
+            continue
+        item: dict[str, Any] = {
+            "type": "function",
+            "name": name,
+            "description": src.get("description") or "",
+            "parameters": src.get("parameters") or {},
+        }
+        for key in ("strict",):
+            if key in src:
+                item[key] = src[key]
+            elif key in t:
+                item[key] = t[key]
+        out.append(item)
     return out
 
 
@@ -282,7 +326,13 @@ def convert_openai_tool_choice(tool_choice: Any) -> Any:
     if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
         fn = tool_choice.get("function") if isinstance(tool_choice.get("function"), dict) else None
         if fn:
-            return {"type": "function", "name": fn.get("name") or ""}
+            name = str(fn.get("name") or "").strip()
+        else:
+            name = str(tool_choice.get("name") or "").strip()
+        if name and _is_console_internal_tool_name(name):
+            return "auto"
+        if name:
+            return {"type": "function", "name": name}
         return dict(tool_choice)
     return tool_choice
 
@@ -548,7 +598,35 @@ def inject_console_reasoning_output(response_json: dict[str, Any]) -> dict[str, 
     return updated
 
 
-def extract_console_tool_calls(response_json: dict[str, Any], ) -> list[dict[str, Any]]:
+def _normalize_client_function_names(
+    function_tool_names: set[str] | list[str] | tuple[str, ...] | None,
+) -> set[str] | None:
+    if function_tool_names is None:
+        return None
+    return {
+        str(name).strip()
+        for name in function_tool_names
+        if str(name).strip() and not _is_console_internal_tool_name(str(name).strip())
+    }
+
+
+def _allows_console_client_function(
+    name: str,
+    allowed_names: set[str] | None,
+) -> bool:
+    name = (name or "").strip()
+    if not name:
+        return False
+    if allowed_names is None:
+        return not _is_console_internal_tool_name(name)
+    return name in allowed_names
+
+
+def extract_console_tool_calls(
+    response_json: dict[str, Any],
+    *,
+    function_tool_names: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
     """Extract tool calls from a non-streaming response.
 
     Returns a list of OpenAI Chat Completions tool_call dicts:
@@ -560,11 +638,15 @@ def extract_console_tool_calls(response_json: dict[str, Any], ) -> list[dict[str
     JSON-serialised ``arguments`` string.
     """
     output = response_json.get("output") or []
+    allowed_names = _normalize_client_function_names(function_tool_names)
     calls: list[dict[str, Any]] = []
     for item in output:
         if not isinstance(item, dict):
             continue
         if item.get("type") != "function_call":
+            continue
+        name = item.get("name") or ""
+        if not _allows_console_client_function(name, allowed_names):
             continue
         call_id = item.get("call_id") or item.get("id") or ""
         calls.append(
@@ -572,11 +654,38 @@ def extract_console_tool_calls(response_json: dict[str, Any], ) -> list[dict[str
                 "id": call_id,
                 "type": "function",
                 "function": {
-                    "name": item.get("name") or "",
+                    "name": name,
                     "arguments": item.get("arguments") or "{}",
                 },
             })
     return calls
+
+
+def filter_console_response_tool_calls(
+    response_json: dict[str, Any],
+    *,
+    function_tool_names: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Remove internal/unallowed function_call output items from Responses JSON."""
+    output = response_json.get("output")
+    if not isinstance(output, list):
+        return response_json
+    allowed_names = _normalize_client_function_names(function_tool_names)
+    filtered_output: list[Any] = []
+    changed = False
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            filtered_output.append(item)
+            continue
+        if _allows_console_client_function(item.get("name") or "", allowed_names):
+            filtered_output.append(item)
+            continue
+        changed = True
+    if not changed:
+        return response_json
+    updated = dict(response_json)
+    updated["output"] = filtered_output
+    return updated
 
 
 def extract_console_search_sources(response_json: dict[str, Any], ) -> list[dict[str, Any]]:
@@ -831,8 +940,11 @@ class ConsoleStreamAdapter:
 
     __slots__ = (
         "_current_event",
+        "_allowed_function_names",
         "_active_tool_index",
         "_tool_args_buf",
+        "_ignored_tool_name",
+        "_ignored_tool_args_buf",
         "_seen_source_urls",
         "_reasoning_header_emitted",
         "_reasoning_line_keys",
@@ -844,10 +956,16 @@ class ConsoleStreamAdapter:
         "_usage",
     )
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        function_tool_names: set[str] | list[str] | tuple[str, ...] | None = None,
+    ) -> None:
         self._current_event: str = ""
+        self._allowed_function_names = _normalize_client_function_names(function_tool_names or ()) or set()
         self._active_tool_index: dict[str, int] = {}  # item_id → index
         self._tool_args_buf: dict[str, list[str]] = {}  # item_id → args chunks
+        self._ignored_tool_name: dict[str, str] = {}
+        self._ignored_tool_args_buf: dict[str, list[str]] = {}
         self._seen_source_urls: set[str] = set()
         self._reasoning_header_emitted = False
         self._reasoning_line_keys: set[str] = set()
@@ -918,9 +1036,17 @@ class ConsoleStreamAdapter:
                 item_id = item.get("id") or item.get("call_id") or ""
                 call_id = item.get("call_id") or item_id
                 name = item.get("name") or ""
+                if not _allows_console_client_function(name, self._allowed_function_names):
+                    if item_id:
+                        self._ignored_tool_name[item_id] = name
+                        self._ignored_tool_args_buf[item_id] = []
+                    return {"kind": "skip"}
                 idx = len(self.tool_calls)
                 self._active_tool_index[item_id] = idx
                 self._tool_args_buf[item_id] = []
+                initial_args = item.get("arguments") if isinstance(item.get("arguments"), str) else ""
+                if initial_args:
+                    self._tool_args_buf[item_id].append(initial_args)
                 self.tool_calls.append(
                     {
                         "id": call_id,
@@ -935,6 +1061,7 @@ class ConsoleStreamAdapter:
                     "index": idx,
                     "call_id": call_id,
                     "name": name,
+                    "arguments": initial_args,
                 }
             return {"kind": "skip"}
 
@@ -942,6 +1069,40 @@ class ConsoleStreamAdapter:
         if ev == "response.output_item.done" or obj.get("type") == "response.output_item.done":
             item = obj.get("item") or {}
             item_type = item.get("type") if isinstance(item, dict) else ""
+            if isinstance(item, dict) and item_type == "function_call":
+                item_id = item.get("id") or item.get("call_id") or ""
+                name = item.get("name") or ""
+                final_args = item.get("arguments") if isinstance(item.get("arguments"), str) else ""
+                idx = self._active_tool_index.get(item_id)
+                if idx is not None:
+                    if final_args:
+                        self.tool_calls[idx]["function"]["arguments"] = final_args
+                    return {"kind": "tool_call_done", "index": idx}
+                if not _allows_console_client_function(name, self._allowed_function_names):
+                    if _is_console_internal_tool_name(name):
+                        return self._synthetic_reasoning_event(
+                            _format_console_tool_trace(name, _parse_tool_arguments(final_args))
+                        )
+                    return {"kind": "skip"}
+                idx = len(self.tool_calls)
+                call_id = item.get("call_id") or item_id
+                self._active_tool_index[item_id] = idx
+                self.tool_calls.append(
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": final_args or "{}",
+                        },
+                    })
+                return {
+                    "kind": "tool_call_start",
+                    "index": idx,
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": final_args,
+                }
             if isinstance(item, dict) and item_type == "web_search_call":
                 action = item.get("action") or {}
                 if isinstance(action, dict):
@@ -976,6 +1137,9 @@ class ConsoleStreamAdapter:
             delta = obj.get("delta") or ""
             if not isinstance(delta, str) or not delta:
                 return {"kind": "skip"}
+            if item_id in self._ignored_tool_name:
+                self._ignored_tool_args_buf.setdefault(item_id, []).append(delta)
+                return {"kind": "skip"}
             idx = self._active_tool_index.get(item_id)
             if idx is None:
                 return {"kind": "skip"}
@@ -986,6 +1150,16 @@ class ConsoleStreamAdapter:
         if ev == "response.function_call_arguments.done" or obj.get(
                 "type") == "response.function_call_arguments.done":
             item_id = obj.get("item_id") or ""
+            if item_id in self._ignored_tool_name:
+                final_args = obj.get("arguments")
+                if not isinstance(final_args, str) or not final_args:
+                    final_args = "".join(self._ignored_tool_args_buf.get(item_id, []))
+                name = self._ignored_tool_name.get(item_id) or "function_call"
+                if _is_console_internal_tool_name(name):
+                    return self._synthetic_reasoning_event(
+                        _format_console_tool_trace(name, _parse_tool_arguments(final_args))
+                    )
+                return {"kind": "skip"}
             idx = self._active_tool_index.get(item_id)
             if idx is None:
                 return {"kind": "skip"}
@@ -994,11 +1168,6 @@ class ConsoleStreamAdapter:
             if not isinstance(final_args, str) or not final_args:
                 final_args = "".join(self._tool_args_buf.get(item_id, []))
             self.tool_calls[idx]["function"]["arguments"] = final_args
-            name = self.tool_calls[idx]["function"].get("name") or "function_call"
-            line = _format_console_tool_trace(name, _parse_tool_arguments(final_args))
-            event = self._synthetic_reasoning_event(line)
-            if event.get("kind") != "skip":
-                return event
             return {"kind": "tool_call_done", "index": idx}
 
         # ── URL citation annotation ───────────────────────────────────────────
@@ -1091,6 +1260,7 @@ class ConsoleStreamAdapter:
 __all__ = [
     "build_console_input",
     "build_console_payload",
+    "client_function_tool_names",
     "convert_openai_tools_to_console",
     "convert_openai_tool_choice",
     "filter_console_tools_for_model",
@@ -1100,6 +1270,7 @@ __all__ = [
     "format_console_reasoning",
     "inject_console_reasoning_output",
     "extract_console_tool_calls",
+    "filter_console_response_tool_calls",
     "extract_console_annotations",
     "extract_console_search_sources",
     "extract_console_usage",

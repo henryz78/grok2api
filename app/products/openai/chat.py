@@ -40,6 +40,7 @@ from app.dataplane.reverse.protocol.xai_console import (
     build_console_input,
     build_console_payload,
     classify_console_sse_line,
+    client_function_tool_names,
     ConsoleStreamAdapter,
     convert_openai_tool_choice,
     convert_openai_tools_to_console,
@@ -625,6 +626,7 @@ async def _console_completions(
         console_tools,
         allow_multi_agent_client_tools=allow_multi_agent_tools,
     )
+    function_tool_names = client_function_tool_names(console_tools)
     console_tool_choice = (
         convert_openai_tool_choice(tool_choice) if console_tools and tool_choice is not None else None)
 
@@ -665,7 +667,7 @@ async def _console_completions(
                 success = False
                 _retry = False
                 fail_exc: BaseException | None = None
-                adapter = ConsoleStreamAdapter()
+                adapter = ConsoleStreamAdapter(function_tool_names=function_tool_names)
                 tool_calls_emitted = False
 
                 try:
@@ -709,7 +711,7 @@ async def _console_completions(
                                         ev["index"],
                                         ev["call_id"],
                                         ev["name"],
-                                        "",
+                                        ev.get("arguments", ""),
                                         is_first=True,
                                     )
                                     yield f"data: {orjson.dumps(chunk).decode()}\n\n"
@@ -871,7 +873,10 @@ async def _console_completions(
 
                 full_text = extract_console_text(response_json)
                 full_thinking = (format_console_reasoning(response_json) if emit_think else "")
-                response_tool_calls = extract_console_tool_calls(response_json)
+                response_tool_calls = extract_console_tool_calls(
+                    response_json,
+                    function_tool_names=function_tool_names,
+                )
                 response_annotations = extract_console_annotations(response_json)
                 response_search_sources = extract_console_search_sources(response_json)
                 usage = extract_console_usage(response_json)

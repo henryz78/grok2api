@@ -267,6 +267,296 @@ class ConsoleProtocolRegressionTests(unittest.TestCase):
             "Thinking about your request\n🔍 web_search: 特朗普 最近行程 2026\n",
         )
 
+    def test_internal_function_tool_names_are_not_client_tools(self):
+        tools = [
+            {"type": "function", "function": {"name": "web_search"}},
+            {"type": "function", "function": {"name": "open_page"}},
+            {"type": "function", "function": {"name": "search"}},
+            {"type": "web_search", "filters": {"allowed_domains": ["x.ai"]}},
+        ]
+
+        self.assertEqual(self.xai_console.client_function_tool_names(tools), {"search"})
+
+        converted = self.xai_console.convert_openai_tools_to_console(tools)
+        converted_function_names = {
+            tool.get("name")
+            for tool in converted
+            if isinstance(tool, dict) and tool.get("type") == "function"
+        }
+
+        self.assertEqual(converted_function_names, {"search"})
+        self.assertIn({"type": "web_search", "filters": {"allowed_domains": ["x.ai"]}}, converted)
+        self.assertEqual(
+            self.xai_console.convert_openai_tool_choice(
+                {"type": "function", "function": {"name": "web_search"}}
+            ),
+            "auto",
+        )
+
+    def test_console_stream_adapter_filters_internal_function_events(self):
+        adapter = self.xai_console.ConsoleStreamAdapter(function_tool_names={"lookup_order"})
+        adapter.feed_event("response.output_item.added")
+
+        started = adapter.feed_data(
+            json.dumps(
+                {
+                    "type": "response.output_item.added",
+                    "item": {
+                        "id": "fc_builtin",
+                        "type": "function_call",
+                        "call_id": "call_builtin",
+                        "name": "web_search",
+                    },
+                }
+            )
+        )
+        adapter.feed_event("response.function_call_arguments.done")
+        finished = adapter.feed_data(
+            json.dumps(
+                {
+                    "type": "response.function_call_arguments.done",
+                    "item_id": "fc_builtin",
+                    "arguments": "{\"query\":\"xAI latest\"}",
+                }
+            )
+        )
+
+        self.assertEqual(started["kind"], "skip")
+        self.assertEqual(finished["kind"], "thinking")
+        self.assertIn("web_search: xAI latest", finished["content"])
+        self.assertEqual(adapter.tool_calls, [])
+
+    def test_console_stream_adapter_allows_declared_client_function_events(self):
+        adapter = self.xai_console.ConsoleStreamAdapter(function_tool_names={"lookup_order"})
+        adapter.feed_event("response.output_item.added")
+
+        started = adapter.feed_data(
+            json.dumps(
+                {
+                    "type": "response.output_item.added",
+                    "item": {
+                        "id": "fc_client",
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "lookup_order",
+                    },
+                }
+            )
+        )
+        adapter.feed_event("response.function_call_arguments.done")
+        finished = adapter.feed_data(
+            json.dumps(
+                {
+                    "type": "response.function_call_arguments.done",
+                    "item_id": "fc_client",
+                    "arguments": "{\"order_id\":\"A123\"}",
+                }
+            )
+        )
+
+        self.assertEqual(started["kind"], "tool_call_start")
+        self.assertEqual(started["name"], "lookup_order")
+        self.assertEqual(finished["kind"], "tool_call_done")
+        self.assertEqual(adapter.tool_calls[0]["function"]["arguments"], "{\"order_id\":\"A123\"}")
+
+    def test_extract_console_tool_calls_filters_to_client_function_names(self):
+        response = {
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_builtin",
+                    "name": "web_search_with_snippets",
+                    "arguments": "{\"query\":\"latest\"}",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup_order",
+                    "arguments": "{\"order_id\":\"A123\"}",
+                },
+            ]
+        }
+
+        self.assertEqual(
+            self.xai_console.extract_console_tool_calls(
+                response,
+                function_tool_names={"lookup_order"},
+            ),
+            [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup_order",
+                        "arguments": "{\"order_id\":\"A123\"}",
+                    },
+                }
+            ],
+        )
+
+    def test_filter_console_response_output_removes_internal_function_calls(self):
+        response = {
+            "id": "resp_1",
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_builtin",
+                    "name": "open_page",
+                    "arguments": "{\"url\":\"https://x.ai\"}",
+                },
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "answer"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup_order",
+                    "arguments": "{\"order_id\":\"A123\"}",
+                },
+            ],
+        }
+
+        filtered = self.xai_console.filter_console_response_tool_calls(
+            response,
+            function_tool_names={"lookup_order"},
+        )
+
+        self.assertEqual(
+            [item.get("name") for item in filtered["output"] if item.get("type") == "function_call"],
+            ["lookup_order"],
+        )
+
+
+class AuthNsfwSequenceRegressionTests(unittest.TestCase):
+    def _load_auth_module(self):
+        _install_common_stubs()
+        prefixes = (
+            "app.dataplane.reverse.protocol.xai_auth",
+            "app.dataplane.proxy.adapters",
+            "app.dataplane.reverse.transport",
+        )
+        saved_modules = {
+            name: module
+            for name, module in sys.modules.items()
+            if any(name == prefix or name.startswith(prefix + ".") for prefix in prefixes)
+        }
+
+        def _restore_modules():
+            for name in list(sys.modules):
+                if any(name == prefix or name.startswith(prefix + ".") for prefix in prefixes):
+                    del sys.modules[name]
+            sys.modules.update(saved_modules)
+
+        self.addCleanup(_restore_modules)
+        _purge_modules(prefixes)
+
+        adapters_pkg = types.ModuleType("app.dataplane.proxy.adapters")
+        adapters_pkg.__path__ = []
+        sys.modules["app.dataplane.proxy.adapters"] = adapters_pkg
+
+        session_mod = types.ModuleType("app.dataplane.proxy.adapters.session")
+
+        class _Session:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        session_mod.ResettableSession = _Session
+        session_mod.build_session_kwargs = lambda **kwargs: dict(kwargs)
+        sys.modules["app.dataplane.proxy.adapters.session"] = session_mod
+
+        transport_pkg = types.ModuleType("app.dataplane.reverse.transport")
+        transport_pkg.__path__ = []
+        sys.modules["app.dataplane.reverse.transport"] = transport_pkg
+
+        grpc_web_mod = types.ModuleType("app.dataplane.reverse.transport.grpc_web")
+        grpc_web_mod.post_grpc_web = None
+        sys.modules["app.dataplane.reverse.transport.grpc_web"] = grpc_web_mod
+
+        http_mod = types.ModuleType("app.dataplane.reverse.transport.http")
+        http_mod.post_json = None
+        sys.modules["app.dataplane.reverse.transport.http"] = http_mod
+
+        return importlib.import_module("app.dataplane.reverse.protocol.xai_auth")
+
+    def test_nsfw_sequence_skips_locked_birth_date_429(self):
+        module = self._load_auth_module()
+        calls = []
+
+        class _Proxy:
+            async def acquire(self, **kwargs):
+                calls.append(("acquire", kwargs.get("clearance_origin")))
+                return object()
+
+            async def feedback(self, lease, result):
+                calls.append(("feedback", result.kind))
+
+        async def _accept_tos(token):
+            calls.append(("accept_tos", token))
+
+        async def _set_birth_date(token, **kwargs):
+            calls.append(("set_birth_date", token))
+            raise module.UpstreamError(
+                "birth date locked",
+                status=429,
+                body="{\"error\":\"birth-date-change-limit-reached\"}",
+            )
+
+        async def _grpc_call(*args, **kwargs):
+            calls.append(("grpc", kwargs.get("label")))
+
+        async def _get_proxy_runtime():
+            return _Proxy()
+
+        module.accept_tos = _accept_tos
+        module.set_birth_date = _set_birth_date
+        module._grpc_call = _grpc_call
+        module.get_proxy_runtime = _get_proxy_runtime
+
+        asyncio.run(module.nsfw_sequence("token-test"))
+
+        self.assertIn(("grpc", "enable_nsfw"), calls)
+
+    def test_nsfw_sequence_keeps_other_birth_date_429_failures(self):
+        module = self._load_auth_module()
+        calls = []
+
+        class _Proxy:
+            async def acquire(self, **kwargs):
+                return object()
+
+            async def feedback(self, lease, result):
+                calls.append(("feedback", result.kind))
+
+        async def _accept_tos(token):
+            calls.append(("accept_tos", token))
+
+        async def _set_birth_date(token, **kwargs):
+            calls.append(("set_birth_date", token))
+            raise module.UpstreamError("real rate limit", status=429, body="{\"error\":\"rate_limit\"}")
+
+        async def _grpc_call(*args, **kwargs):
+            calls.append(("grpc", kwargs.get("label")))
+
+        async def _get_proxy_runtime():
+            return _Proxy()
+
+        module.accept_tos = _accept_tos
+        module.set_birth_date = _set_birth_date
+        module._grpc_call = _grpc_call
+        module.get_proxy_runtime = _get_proxy_runtime
+
+        with self.assertRaises(module.UpstreamError):
+            asyncio.run(module.nsfw_sequence("token-test"))
+
+        self.assertNotIn(("grpc", "enable_nsfw"), calls)
+
 
 class ConsoleReasoningDefaultsTests(unittest.TestCase):
     @classmethod

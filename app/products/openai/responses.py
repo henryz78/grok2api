@@ -20,10 +20,12 @@ from app.control.account.enums import FeedbackKind
 from app.dataplane.reverse.protocol.xai_chat import classify_line, StreamAdapter
 from app.dataplane.reverse.protocol.xai_console import (
     build_console_input,
+    client_function_tool_names,
     convert_openai_tool_choice,
     convert_openai_tools_to_console,
     extract_console_sse_error,
     extract_console_usage,
+    filter_console_response_tool_calls,
     filter_console_tools_for_model,
     inject_console_reasoning_output,
     inject_web_search_tool,
@@ -286,6 +288,7 @@ async def _console_responses_dispatch(
         console_tools,
         allow_multi_agent_client_tools=allow_multi_agent_tools,
     )
+    function_tool_names = client_function_tool_names(console_tools)
     console_tool_choice = (
         convert_openai_tool_choice(tool_choice) if console_tools and tool_choice is not None else None)
 
@@ -515,7 +518,12 @@ async def _console_responses_dispatch(
         response_json.get("status"),
         extract_console_usage(response_json),
     )
-    return inject_console_reasoning_output(response_json) if emit_think else response_json
+    if emit_think:
+        response_json = inject_console_reasoning_output(response_json)
+    return filter_console_response_tool_calls(
+        response_json,
+        function_tool_names=function_tool_names,
+    )
 
 
 # ---------------------------------------------------------------------------
