@@ -43,6 +43,8 @@ enable_nsfw = true
 # 搜索信源始终以 search_sources 结构化字段输出（无需此开关）。
 # 此选项仅控制是否同时在响应正文末尾追加 ## Sources 纯文本段落（兼容文本解析客户端）。
 show_search_sources = false
+# 是否允许 console multi-agent 模型透传客户端 function tools；默认关闭以避免 betaaccess 上游错误。
+console_multi_agent_native_tools = false
 # 全局附加指令
 custom_instruction = ""
 

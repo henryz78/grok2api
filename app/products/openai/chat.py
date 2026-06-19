@@ -619,7 +619,12 @@ async def _console_completions(
 
     # Convert OpenAI tools → console tools (flat name/description/parameters).
     console_tools = convert_openai_tools_to_console(tools) if tools else None
-    console_tools = filter_console_tools_for_model(console_model, console_tools)
+    allow_multi_agent_tools = cfg.get_bool("features.console_multi_agent_native_tools", False)
+    console_tools = filter_console_tools_for_model(
+        console_model,
+        console_tools,
+        allow_multi_agent_client_tools=allow_multi_agent_tools,
+    )
     console_tool_choice = (
         convert_openai_tool_choice(tool_choice) if console_tools and tool_choice is not None else None)
 

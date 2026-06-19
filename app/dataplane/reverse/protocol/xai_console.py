@@ -290,16 +290,22 @@ def convert_openai_tool_choice(tool_choice: Any) -> Any:
 def filter_console_tools_for_model(
     console_model: str,
     tools: list[dict[str, Any]] | None,
+    *,
+    allow_multi_agent_client_tools: bool = False,
 ) -> list[dict[str, Any]]:
     """Remove client-side function tools from restricted console models.
 
     Multi-agent currently rejects client-side function tools with a beta access
     error. Built-in server-side tools such as ``web_search`` and ``x_search``
-    are still accepted, so keep those and only drop ``type=function`` entries.
+    are still accepted, so keep those and only drop ``type=function`` entries
+    unless the operator explicitly enables native multi-agent tools.
     """
     if not tools:
         return []
     if console_model != _MULTI_AGENT_CONSOLE_MODEL:
+        return list(tools)
+    if allow_multi_agent_client_tools:
+        logger.info("console multi-agent client tools enabled by config: model={}", console_model)
         return list(tools)
     filtered = [
         dict(tool)

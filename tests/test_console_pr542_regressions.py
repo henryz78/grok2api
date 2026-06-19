@@ -145,6 +145,29 @@ class ConsoleProtocolRegressionTests(unittest.TestCase):
 
         self.assertEqual(filtered, [{"type": "web_search"}])
 
+    def test_multi_agent_can_keep_client_function_tools_when_enabled(self):
+        tools = self.xai_console.convert_openai_tools_to_console(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {"type": "object"},
+                    },
+                },
+                {"type": "web_search"},
+            ]
+        )
+
+        filtered = self.xai_console.filter_console_tools_for_model(
+            "grok-4.20-multi-agent-0309",
+            tools,
+            allow_multi_agent_client_tools=True,
+        )
+
+        self.assertEqual([tool["type"] for tool in filtered], ["function", "web_search"])
+
     def test_non_multi_agent_keeps_client_function_tools(self):
         tools = self.xai_console.convert_openai_tools_to_console(
             [

@@ -524,6 +524,8 @@ class StableJiujiuUpdateTests(unittest.TestCase):
         self.assertIn("if (_batchEs) return false;", account)
         self.assertIn("auto_nsfw_on_import", config)
         self.assertIn("auto_nsfw_on_import = false", defaults)
+        self.assertIn("console_multi_agent_native_tools", config)
+        self.assertIn("console_multi_agent_native_tools = false", defaults)
 
     def test_auto_pool_import_refreshes_in_background(self):
         source = (REPO_ROOT / "app" / "products" / "web" / "admin" / "tokens.py").read_text(
@@ -540,3 +542,13 @@ class StableJiujiuUpdateTests(unittest.TestCase):
         self.assertIn('"cryptography>=48.0.1"', source)
         self.assertIn('"python-multipart>=0.0.31"', source)
         self.assertIn('"starlette>=1.1.0"', source)
+
+    def test_console_multi_agent_native_tools_config_is_wired(self):
+        chat = (REPO_ROOT / "app" / "products" / "openai" / "chat.py").read_text(encoding="utf-8")
+        responses = (REPO_ROOT / "app" / "products" / "openai" / "responses.py").read_text(
+            encoding="utf-8"
+        )
+
+        for source in (chat, responses):
+            self.assertIn('get_bool("features.console_multi_agent_native_tools", False)', source)
+            self.assertIn("allow_multi_agent_client_tools=allow_multi_agent_tools", source)
