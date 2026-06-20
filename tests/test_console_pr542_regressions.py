@@ -664,8 +664,8 @@ class ConsoleQuotaIsolationTests(unittest.TestCase):
         self.assertIsNotNone(quota_set.console)
         self.assertEqual(quota_set.fast.total, 30)
         self.assertEqual(quota_set.fast.window_seconds, 86_400)
-        self.assertEqual(quota_set.console.total, 30)
-        self.assertEqual(quota_set.console.window_seconds, 1_800)
+        self.assertEqual(quota_set.console.total, 20)
+        self.assertEqual(quota_set.console.window_seconds, 3_600)
 
     def test_runtime_sync_indexes_console_quota_separately_from_fast(self):
         console_mode = int(self.model_enums.ModeId.CONSOLE)
@@ -683,7 +683,7 @@ class ConsoleQuotaIsolationTests(unittest.TestCase):
         self.assertEqual(args["quota_fast"], 0)
         self.assertEqual(args["quota_console"], 7)
         self.assertEqual(args["window_fast"], 86_400)
-        self.assertEqual(args["window_console"], 1_800)
+        self.assertEqual(args["window_console"], 3_600)
         self.assertEqual(console_mode, 5)
 
     def test_console_mode_quota_refresh_does_not_hit_grok_rate_limits(self):

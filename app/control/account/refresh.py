@@ -521,7 +521,7 @@ class AccountRefreshService:
                     if (
                         mode_id == 5
                         and reset_at is None
-                        and new_remaining <= 20
+                        and new_remaining <= 12
                         and existing.window_seconds > 0
                     ):
                         reset_at = now + existing.window_seconds * 1000
