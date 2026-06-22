@@ -445,23 +445,29 @@ class AccountRefreshService:
                                 synced_at=window.synced_at,
                                 source=QuotaSource.ESTIMATED,
                             ).to_dict()
-                            if new_remaining <= 0 and record.usage_fail_count + 1 >= 5:
+                            console_429_count = int(
+                                (record.ext or {}).get("console_429_count", 0)
+                            )
+                            new_429_count = console_429_count + 1
+                            ext_merge: dict = {
+                                **(record.ext or {}),
+                                "console_429_count": new_429_count,
+                            }
+                            if new_remaining <= 0 and new_429_count >= 3:
                                 extra_patch["status"] = AccountStatus.EXPIRED
                                 extra_patch["state_reason"] = (
                                     "console_429_threshold_exceeded"
                                 )
-                                extra_patch["ext_merge"] = {
-                                    **(record.ext or {}),
-                                    "expired_at": now,
-                                    "expired_reason": (
-                                        "console_429_threshold_exceeded"
-                                    ),
-                                }
-                                logger.info(
-                                    "account marked expired due to repeated console 429: token={}... fail_count={}",
-                                    token[:10],
-                                    record.usage_fail_count + 1,
+                                ext_merge["expired_at"] = now
+                                ext_merge["expired_reason"] = (
+                                    "console_429_threshold_exceeded"
                                 )
+                                logger.info(
+                                    "account marked expired due to repeated console 429: token={}... count={}",
+                                    token[:10],
+                                    new_429_count,
+                                )
+                            extra_patch["ext_merge"] = ext_merge
                         else:
                             reset_at = (
                                 window.reset_at

@@ -384,8 +384,46 @@ class AccountRefreshBootstrapTests(unittest.TestCase):
         self.assertIsNotNone(window.reset_at)
         self.assertEqual(patch.usage_fail_delta, 1)
         self.assertEqual(patch.last_fail_reason, "rate_limited")
+        self.assertEqual(patch.ext_merge["console_429_count"], 1)
 
-    def test_record_failure_async_console_429_expires_after_repeated_failures(self):
+    def test_record_failure_async_console_429_uses_independent_counter(self):
+        patches = []
+        quota_set = self.quota_defaults.default_quota_set("basic")
+        assert quota_set.console is not None
+        quota_set.console.remaining = 20
+        record = self.models.AccountRecord(
+            token="tok-console-counter",
+            pool="basic",
+            quota=quota_set.to_dict(),
+            usage_fail_count=99,
+            ext={"console_429_count": 1},
+        )
+        upstream_error = importlib.import_module("app.platform.errors").UpstreamError(
+            "rate limited",
+            status=429,
+        )
+
+        class _Repo:
+            async def get_accounts(self, tokens):
+                return [record]
+
+            async def patch_accounts(self, account_patches):
+                patches.extend(account_patches)
+
+        async def _run():
+            svc = self.refresh_mod.AccountRefreshService(_Repo())
+            await svc.record_failure_async("tok-console-counter", 5, upstream_error)
+
+        asyncio.run(_run())
+
+        self.assertEqual(len(patches), 1)
+        patch = patches[0]
+        window = self.models.QuotaWindow.from_dict(patch.quota_console)
+        self.assertEqual(window.remaining, 10)
+        self.assertIsNone(patch.status)
+        self.assertEqual(patch.ext_merge["console_429_count"], 2)
+
+    def test_record_failure_async_console_429_expires_after_third_console_429(self):
         patches = []
         quota_set = self.quota_defaults.default_quota_set("basic")
         assert quota_set.console is not None
@@ -394,7 +432,7 @@ class AccountRefreshBootstrapTests(unittest.TestCase):
             token="tok-console-expire",
             pool="basic",
             quota=quota_set.to_dict(),
-            usage_fail_count=4,
+            ext={"console_429_count": 2},
         )
         upstream_error = importlib.import_module("app.platform.errors").UpstreamError(
             "rate limited",
@@ -420,6 +458,7 @@ class AccountRefreshBootstrapTests(unittest.TestCase):
         self.assertEqual(window.remaining, 0)
         self.assertEqual(patch.status, self.enums.AccountStatus.EXPIRED)
         self.assertEqual(patch.state_reason, "console_429_threshold_exceeded")
+        self.assertEqual(patch.ext_merge["console_429_count"], 3)
         self.assertEqual(patch.ext_merge["expired_reason"], "console_429_threshold_exceeded")
 
     def test_local_repository_bulk_resets_expired_console_windows(self):
@@ -477,6 +516,40 @@ class AccountRefreshBootstrapTests(unittest.TestCase):
         self.assertEqual(records["tok-stale"].quota_set().console.remaining, 20)
         self.assertEqual(records["tok-good"].quota_set().console.remaining, 7)
 
+    def test_local_repository_clear_failures_clears_console_429_counter(self):
+        _install_common_stubs()
+        local_mod = importlib.import_module("app.control.account.backends.local")
+        commands = importlib.import_module("app.control.account.commands")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = local_mod.LocalAccountRepository(Path(tmpdir) / "accounts.db")
+            asyncio.run(repo.initialize())
+            asyncio.run(repo.upsert_accounts([commands.AccountUpsert(token="tok-clear")]))
+            asyncio.run(
+                repo.patch_accounts(
+                    [
+                        commands.AccountPatch(
+                            token="tok-clear",
+                            status=self.enums.AccountStatus.EXPIRED,
+                            ext_merge={
+                                "console_429_count": 3,
+                                "expired_reason": "console_429_threshold_exceeded",
+                            },
+                        )
+                    ]
+                )
+            )
+            asyncio.run(
+                repo.patch_accounts(
+                    [commands.AccountPatch(token="tok-clear", clear_failures=True)]
+                )
+            )
+            record = asyncio.run(repo.get_accounts(["tok-clear"]))[0]
+
+        self.assertEqual(record.status, self.enums.AccountStatus.ACTIVE)
+        self.assertNotIn("console_429_count", record.ext)
+        self.assertNotIn("expired_reason", record.ext)
+
 
 class ConsoleQuotaSyncTests(unittest.TestCase):
     def test_console_quota_sync_runs_in_random_strategy(self):
@@ -504,6 +577,89 @@ class ConsoleQuotaSyncTests(unittest.TestCase):
 
 
 class StableJiujiuUpdateTests(unittest.TestCase):
+    def _runtime_table_for_selection(self):
+        _install_common_stubs()
+        table_mod = importlib.import_module("app.dataplane.account.table")
+        shared = importlib.import_module("app.dataplane.shared.enums")
+        table = table_mod.make_empty_table()
+
+        def _append(token: str, quota: int, *, inflight: int = 0, fails: int = 0, last_use_s: int = 0):
+            idx = table._append_slot(
+                token=token,
+                pool_id=int(shared.PoolId.BASIC),
+                status_id=int(shared.StatusId.ACTIVE),
+                quota_auto=0,
+                quota_fast=quota,
+                quota_expert=0,
+                quota_heavy=-1,
+                quota_grok_4_3=-1,
+                quota_console=20,
+                total_auto=0,
+                total_fast=30,
+                total_expert=0,
+                total_heavy=0,
+                total_grok_4_3=0,
+                total_console=20,
+                window_auto=0,
+                window_fast=86400,
+                window_expert=0,
+                window_heavy=0,
+                window_grok_4_3=0,
+                window_console=3600,
+                reset_auto=0,
+                reset_fast=0,
+                reset_expert=0,
+                reset_heavy=0,
+                reset_grok_4_3=0,
+                reset_console=0,
+                health=1.0,
+                last_use_s=last_use_s,
+                last_fail_s=0,
+                fail_count=fails,
+                tags=[],
+            )
+            table.inflight_by_idx[idx] = inflight
+            return idx
+
+        return table, shared, _append
+
+    def test_quota_selector_spreads_recent_and_inflight_heavy_accounts(self):
+        selector = importlib.import_module("app.dataplane.account.selector")
+        table, shared, append = self._runtime_table_for_selection()
+        blocked_recent = append("tok-recent", 20, last_use_s=50)
+        blocked_inflight = append("tok-inflight", 999, inflight=12)
+        chosen = append("tok-ready", 20)
+
+        selected = selector._quota_select(
+            table,
+            int(shared.PoolId.BASIC),
+            int(shared.ModeId.FAST),
+            exclude_idxs=None,
+            prefer_tag_idxs=None,
+            now_s=100,
+        )
+
+        self.assertEqual(selected, chosen)
+        self.assertNotEqual(selected, blocked_recent)
+        self.assertNotEqual(selected, blocked_inflight)
+
+    def test_random_selector_filters_high_fail_accounts(self):
+        selector = importlib.import_module("app.dataplane.account.selector")
+        table, shared, append = self._runtime_table_for_selection()
+        blocked_failed = append("tok-failed", 30, fails=5)
+        chosen = append("tok-random-ready", 30)
+
+        selected = selector._random_select(
+            table,
+            int(shared.PoolId.BASIC),
+            exclude_idxs=None,
+            prefer_tag_idxs=None,
+            now_s=100,
+        )
+
+        self.assertEqual(selected, chosen)
+        self.assertNotEqual(selected, blocked_failed)
+
     def test_run_batch_uses_worker_pool_and_preserves_order(self):
         runtime_batch = importlib.import_module("app.platform.runtime.batch")
         active = 0
