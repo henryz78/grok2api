@@ -22,7 +22,11 @@ from ..models import (
 )
 from redis.asyncio import Redis
 
-from ..quota_defaults import default_quota_set
+from ..quota_defaults import (
+    BASIC_CONSOLE_LIMIT,
+    BASIC_CONSOLE_WINDOW_SECONDS,
+    default_quota_set,
+)
 
 _KEY_REV      = "accounts:rev"
 _KEY_RECORD   = "accounts:record:{token}"
@@ -173,13 +177,18 @@ class RedisAccountRepository:
             _KEY_REV_LOG,
             since_revision + 1,
             "+inf",
-            withscores=False,
+            withscores=True,
             start=0,
             num=limit,
         )
-        tokens = [
-            (e.decode() if isinstance(e, bytes) else e) for e in entries
-        ]
+        tokens: list[str] = []
+        batch_max_rev = 0
+        for entry in entries:
+            token_raw, score = entry
+            token = token_raw.decode() if isinstance(token_raw, bytes) else token_raw
+            score_i = int(score)
+            batch_max_rev = max(batch_max_rev, score_i)
+            tokens.append(token)
         items: list[AccountRecord] = []
         deleted: list[str] = []
         for token in tokens:
@@ -194,6 +203,7 @@ class RedisAccountRepository:
                 items.append(record)
         return AccountChangeSet(
             revision=rev,
+            batch_max_revision=batch_max_rev,
             items=items,
             deleted_tokens=deleted,
             has_more=len(entries) == limit,
@@ -423,6 +433,66 @@ class RedisAccountRepository:
             deleted=deleted_result.deleted,
             revision=upserted_result.revision,
         )
+
+    async def reset_expired_console_windows(self) -> int:
+        """Reset recoverable local console quota windows for Redis storage."""
+        now = now_ms()
+        reset_json = json.dumps(
+            {
+                "remaining": BASIC_CONSOLE_LIMIT,
+                "total": BASIC_CONSOLE_LIMIT,
+                "window_seconds": BASIC_CONSOLE_WINDOW_SECONDS,
+                "reset_at": None,
+                "synced_at": now,
+                "source": 0,
+            }
+        )
+
+        to_reset: list[str] = []
+        async for key_raw in self._r.scan_iter("accounts:record:*"):
+            key = key_raw.decode() if isinstance(key_raw, bytes) else key_raw
+            h = await self._r.hgetall(key)
+            if not h:
+                continue
+
+            def _s(k: str) -> str:
+                v = h.get(k) or h.get(k.encode())
+                return v.decode() if isinstance(v, bytes) else (v or "")
+
+            if _s("status") != "active" or _s("deleted_at"):
+                continue
+            quota_raw = _s("quota_console")
+            if not quota_raw or quota_raw == "{}":
+                continue
+            try:
+                quota = json.loads(quota_raw)
+            except (TypeError, ValueError):
+                continue
+            remaining = int(quota.get("remaining") or 0)
+            reset_raw = quota.get("reset_at")
+            reset_at = int(reset_raw) if reset_raw is not None else None
+            exhausted_recoverable = remaining <= 0 and (reset_at is None or reset_at < now)
+            stale_timer = reset_at is not None and reset_at < now
+            if exhausted_recoverable or stale_timer:
+                to_reset.append(key.split(":", 2)[-1])
+
+        if not to_reset:
+            return 0
+
+        rev = await self._bump_revision()
+        async with self._r.pipeline() as pipe:
+            for token in to_reset:
+                pipe.hset(
+                    _record_key(token),
+                    mapping={
+                        "quota_console": reset_json,
+                        "revision": str(rev),
+                        "updated_at": str(now),
+                    },
+                )
+                pipe.zadd(_KEY_REV_LOG, {token: rev})
+            await pipe.execute()
+        return len(to_reset)
 
     async def close(self) -> None:
         """Close the underlying Redis connection pool."""

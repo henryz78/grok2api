@@ -321,6 +321,9 @@ class AccountPage(BaseModel):
 
 class AccountChangeSet(BaseModel):
     revision: int = 0
+    # Highest revision observed in this returned batch. When has_more=True,
+    # callers advance only to this value to avoid skipping unseen rows.
+    batch_max_revision: int = 0
     items: list[AccountRecord] = Field(default_factory=list)
     deleted_tokens: list[str] = Field(default_factory=list)
     has_more: bool = False

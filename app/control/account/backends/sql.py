@@ -26,7 +26,11 @@ from ..models import (
     AccountRecord,
     RuntimeSnapshot,
 )
-from ..quota_defaults import default_quota_set
+from ..quota_defaults import (
+    BASIC_CONSOLE_LIMIT,
+    BASIC_CONSOLE_WINDOW_SECONDS,
+    default_quota_set,
+)
 
 _TBL_ACCOUNTS = "accounts"
 _TBL_META     = "account_meta"
@@ -622,14 +626,17 @@ class SqlAccountRepository:
             )).fetchall()
             items: list[AccountRecord] = []
             deleted: list[str] = []
+            batch_max_rev = 0
             for row in rows:
                 r = _row_to_record(row)
+                batch_max_rev = max(batch_max_rev, r.revision)
                 if r.is_deleted():
                     deleted.append(r.token)
                 else:
                     items.append(r)
             return AccountChangeSet(
                 revision=rev,
+                batch_max_revision=batch_max_rev,
                 items=items,
                 deleted_tokens=deleted,
                 has_more=len(rows) == limit,
@@ -690,7 +697,9 @@ class SqlAccountRepository:
             count = 0
             for patch in patches:
                 row = (await conn.execute(
-                    sa.select(accounts_table).where(accounts_table.c.token == patch.token)
+                    sa.select(accounts_table)
+                    .where(accounts_table.c.token == patch.token)
+                    .with_for_update()
                 )).fetchone()
                 if row is None:
                     continue
@@ -726,11 +735,20 @@ class SqlAccountRepository:
                 if patch.quota_console is not None:
                     updates["quota_console"] = json.dumps(patch.quota_console)
                 if patch.usage_use_delta is not None:
-                    updates["usage_use_count"] = max(0, record.usage_use_count + patch.usage_use_delta)
+                    updates["usage_use_count"] = sa.func.greatest(
+                        0,
+                        accounts_table.c.usage_use_count + int(patch.usage_use_delta),
+                    )
                 if patch.usage_fail_delta is not None:
-                    updates["usage_fail_count"] = max(0, record.usage_fail_count + patch.usage_fail_delta)
+                    updates["usage_fail_count"] = sa.func.greatest(
+                        0,
+                        accounts_table.c.usage_fail_count + int(patch.usage_fail_delta),
+                    )
                 if patch.usage_sync_delta is not None:
-                    updates["usage_sync_count"] = max(0, record.usage_sync_count + patch.usage_sync_delta)
+                    updates["usage_sync_count"] = sa.func.greatest(
+                        0,
+                        accounts_table.c.usage_sync_count + int(patch.usage_sync_delta),
+                    )
 
                 tags = list(record.tags)
                 if patch.tags is not None:
@@ -861,6 +879,107 @@ class SqlAccountRepository:
             deleted=deleted,
             revision=upserted_result.revision,
         )
+
+    async def reset_expired_console_windows(self) -> int:
+        """Batch-reset recoverable local console quota windows."""
+        await self._ensure_initialized()
+        now = now_ms()
+        reset_json = json.dumps(
+            {
+                "remaining": BASIC_CONSOLE_LIMIT,
+                "total": BASIC_CONSOLE_LIMIT,
+                "window_seconds": BASIC_CONSOLE_WINDOW_SECONDS,
+                "reset_at": None,
+                "synced_at": now,
+                "source": 0,
+            }
+        )
+
+        if self._dialect == "postgresql":
+            quota_expr = "(quota_console::jsonb)"
+            count_sql = sa.text(
+                "SELECT COUNT(*) FROM accounts"
+                " WHERE status = 'active'"
+                " AND deleted_at IS NULL"
+                " AND ("
+                f"   (({quota_expr}->>'remaining')::int <= 0"
+                "     AND ("
+                f"       {quota_expr}->>'reset_at' IS NULL"
+                f"       OR ({quota_expr}->>'reset_at')::bigint < :now"
+                "     )"
+                "   )"
+                "   OR ("
+                f"     {quota_expr}->>'reset_at' IS NOT NULL"
+                f"     AND ({quota_expr}->>'reset_at')::bigint < :now"
+                "   )"
+                " )"
+            )
+            update_sql = sa.text(
+                "UPDATE accounts"
+                " SET quota_console = :reset_json, revision = :rev, updated_at = :now"
+                " WHERE status = 'active'"
+                " AND deleted_at IS NULL"
+                " AND ("
+                f"   (({quota_expr}->>'remaining')::int <= 0"
+                "     AND ("
+                f"       {quota_expr}->>'reset_at' IS NULL"
+                f"       OR ({quota_expr}->>'reset_at')::bigint < :now"
+                "     )"
+                "   )"
+                "   OR ("
+                f"     {quota_expr}->>'reset_at' IS NOT NULL"
+                f"     AND ({quota_expr}->>'reset_at')::bigint < :now"
+                "   )"
+                " )"
+            )
+        else:
+            count_sql = sa.text(
+                "SELECT COUNT(*) FROM accounts"
+                " WHERE status = 'active'"
+                " AND deleted_at IS NULL"
+                " AND ("
+                "   (CAST(JSON_EXTRACT(quota_console, '$.remaining') AS SIGNED) <= 0"
+                "     AND ("
+                "       JSON_EXTRACT(quota_console, '$.reset_at') IS NULL"
+                "       OR CAST(JSON_EXTRACT(quota_console, '$.reset_at') AS SIGNED) < :now"
+                "     )"
+                "   )"
+                "   OR ("
+                "     JSON_EXTRACT(quota_console, '$.reset_at') IS NOT NULL"
+                "     AND CAST(JSON_EXTRACT(quota_console, '$.reset_at') AS SIGNED) < :now"
+                "   )"
+                " )"
+            )
+            update_sql = sa.text(
+                "UPDATE accounts"
+                " SET quota_console = :reset_json, revision = :rev, updated_at = :now"
+                " WHERE status = 'active'"
+                " AND deleted_at IS NULL"
+                " AND ("
+                "   (CAST(JSON_EXTRACT(quota_console, '$.remaining') AS SIGNED) <= 0"
+                "     AND ("
+                "       JSON_EXTRACT(quota_console, '$.reset_at') IS NULL"
+                "       OR CAST(JSON_EXTRACT(quota_console, '$.reset_at') AS SIGNED) < :now"
+                "     )"
+                "   )"
+                "   OR ("
+                "     JSON_EXTRACT(quota_console, '$.reset_at') IS NOT NULL"
+                "     AND CAST(JSON_EXTRACT(quota_console, '$.reset_at') AS SIGNED) < :now"
+                "   )"
+                " )"
+            )
+
+        async with self._engine.begin() as conn:
+            result = await conn.execute(count_sql, {"now": now})
+            count = int(result.scalar() or 0)
+            if count == 0:
+                return 0
+            rev = await self._bump_revision(conn)
+            result = await conn.execute(
+                update_sql,
+                {"reset_json": reset_json, "rev": rev, "now": now},
+            )
+            return int(result.rowcount or count)
 
     async def close(self) -> None:
         """Dispose the SQLAlchemy connection pool."""

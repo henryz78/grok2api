@@ -147,10 +147,12 @@ async def apply_changes(
 
             changed = True
 
-        if changeset.revision > table.revision:
-            table.revision = changeset.revision
-
-        if not changeset.has_more:
+        if changeset.has_more:
+            if changeset.batch_max_revision > table.revision:
+                table.revision = changeset.batch_max_revision
+        else:
+            if changeset.revision > table.revision:
+                table.revision = changeset.revision
             break
 
     return changed

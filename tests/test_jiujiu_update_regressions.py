@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import importlib.util
 import json
+import tempfile
 import sys
 import types
 import unittest
@@ -243,26 +244,9 @@ class AccountRefreshBootstrapTests(unittest.TestCase):
         self.assertIsNotNone(patches[0].quota_grok_4_3)
 
     def test_reset_expired_console_windows_restores_local_console_quota(self):
-        patches = []
-        quota_set = self.quota_defaults.default_quota_set("basic")
-        assert quota_set.console is not None
-        quota_set.console.remaining = 0
-        quota_set.console.reset_at = 1
-        record = self.models.AccountRecord(
-            token="tok-console-expired",
-            pool="basic",
-            quota=quota_set.to_dict(),
-        )
-
-        class _Snapshot:
-            items = [record]
-
         class _Repo:
-            async def runtime_snapshot(self):
-                return _Snapshot()
-
-            async def patch_accounts(self, account_patches):
-                patches.extend(account_patches)
+            async def reset_expired_console_windows(self):
+                return 3
 
         async def _run():
             svc = self.refresh_mod.AccountRefreshService(_Repo())
@@ -270,11 +254,7 @@ class AccountRefreshBootstrapTests(unittest.TestCase):
 
         count = asyncio.run(_run())
 
-        self.assertEqual(count, 1)
-        restored = self.models.QuotaWindow.from_dict(patches[0].quota_console)
-        self.assertEqual(restored.remaining, 20)
-        self.assertEqual(restored.total, 20)
-        self.assertEqual(restored.window_seconds, 3_600)
+        self.assertEqual(count, 3)
 
     def test_refresh_call_async_console_deducts_locally_without_upstream_fetch(self):
         patches = []
@@ -365,8 +345,137 @@ class AccountRefreshBootstrapTests(unittest.TestCase):
         window = self.models.QuotaWindow.from_dict(patches[0].quota_console)
         self.assertEqual(window.remaining, 19)
         self.assertEqual(window.total, 20)
-        self.assertIsNotNone(window.reset_at)
+        self.assertIsNone(window.reset_at)
         self.assertEqual(window.source, self.enums.QuotaSource.DEFAULT)
+
+    def test_record_failure_async_console_429_decrements_without_zeroing(self):
+        patches = []
+        quota_set = self.quota_defaults.default_quota_set("basic")
+        assert quota_set.console is not None
+        quota_set.console.remaining = 20
+        quota_set.console.reset_at = None
+        record = self.models.AccountRecord(
+            token="tok-console-429",
+            pool="basic",
+            quota=quota_set.to_dict(),
+        )
+        upstream_error = importlib.import_module("app.platform.errors").UpstreamError(
+            "rate limited",
+            status=429,
+        )
+
+        class _Repo:
+            async def get_accounts(self, tokens):
+                return [record]
+
+            async def patch_accounts(self, account_patches):
+                patches.extend(account_patches)
+
+        async def _run():
+            svc = self.refresh_mod.AccountRefreshService(_Repo())
+            await svc.record_failure_async("tok-console-429", 5, upstream_error)
+
+        asyncio.run(_run())
+
+        self.assertEqual(len(patches), 1)
+        patch = patches[0]
+        window = self.models.QuotaWindow.from_dict(patch.quota_console)
+        self.assertEqual(window.remaining, 10)
+        self.assertIsNotNone(window.reset_at)
+        self.assertEqual(patch.usage_fail_delta, 1)
+        self.assertEqual(patch.last_fail_reason, "rate_limited")
+
+    def test_record_failure_async_console_429_expires_after_repeated_failures(self):
+        patches = []
+        quota_set = self.quota_defaults.default_quota_set("basic")
+        assert quota_set.console is not None
+        quota_set.console.remaining = 5
+        record = self.models.AccountRecord(
+            token="tok-console-expire",
+            pool="basic",
+            quota=quota_set.to_dict(),
+            usage_fail_count=4,
+        )
+        upstream_error = importlib.import_module("app.platform.errors").UpstreamError(
+            "rate limited",
+            status=429,
+        )
+
+        class _Repo:
+            async def get_accounts(self, tokens):
+                return [record]
+
+            async def patch_accounts(self, account_patches):
+                patches.extend(account_patches)
+
+        async def _run():
+            svc = self.refresh_mod.AccountRefreshService(_Repo())
+            await svc.record_failure_async("tok-console-expire", 5, upstream_error)
+
+        asyncio.run(_run())
+
+        self.assertEqual(len(patches), 1)
+        patch = patches[0]
+        window = self.models.QuotaWindow.from_dict(patch.quota_console)
+        self.assertEqual(window.remaining, 0)
+        self.assertEqual(patch.status, self.enums.AccountStatus.EXPIRED)
+        self.assertEqual(patch.state_reason, "console_429_threshold_exceeded")
+        self.assertEqual(patch.ext_merge["expired_reason"], "console_429_threshold_exceeded")
+
+    def test_local_repository_bulk_resets_expired_console_windows(self):
+        _install_common_stubs()
+        local_mod = importlib.import_module("app.control.account.backends.local")
+        commands = importlib.import_module("app.control.account.commands")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = local_mod.LocalAccountRepository(Path(tmpdir) / "accounts.db")
+            asyncio.run(repo.initialize())
+            asyncio.run(
+                repo.upsert_accounts(
+                    [
+                        commands.AccountUpsert(token="tok-zero"),
+                        commands.AccountUpsert(token="tok-stale"),
+                        commands.AccountUpsert(token="tok-good"),
+                    ]
+                )
+            )
+
+            quota_zero = self.quota_defaults.default_quota_set("basic")
+            assert quota_zero.console is not None
+            quota_zero.console.remaining = 0
+            quota_zero.console.reset_at = None
+
+            quota_stale = self.quota_defaults.default_quota_set("basic")
+            assert quota_stale.console is not None
+            quota_stale.console.remaining = 7
+            quota_stale.console.reset_at = 1
+
+            quota_good = self.quota_defaults.default_quota_set("basic")
+            assert quota_good.console is not None
+            quota_good.console.remaining = 7
+            quota_good.console.reset_at = 9_999_999_999_999
+
+            patch_cls = commands.AccountPatch
+            asyncio.run(
+                repo.patch_accounts(
+                    [
+                        patch_cls(token="tok-zero", quota_console=quota_zero.console.to_dict()),
+                        patch_cls(token="tok-stale", quota_console=quota_stale.console.to_dict()),
+                        patch_cls(token="tok-good", quota_console=quota_good.console.to_dict()),
+                    ]
+                )
+            )
+
+            count = asyncio.run(repo.reset_expired_console_windows())
+            records = {
+                record.token: record
+                for record in asyncio.run(repo.get_accounts(["tok-zero", "tok-stale", "tok-good"]))
+            }
+
+        self.assertEqual(count, 2)
+        self.assertEqual(records["tok-zero"].quota_set().console.remaining, 20)
+        self.assertEqual(records["tok-stale"].quota_set().console.remaining, 20)
+        self.assertEqual(records["tok-good"].quota_set().console.remaining, 7)
 
 
 class ConsoleQuotaSyncTests(unittest.TestCase):
@@ -429,6 +538,36 @@ class StableJiujiuUpdateTests(unittest.TestCase):
         self.assertIn("_MAX_BATCH_CONCURRENCY = 50", source)
         self.assertIn("await run_batch(tokens, _one, concurrency=concurrency)", source)
         self.assertNotIn("await asyncio.gather(*[_one(t) for t in tokens])", source)
+
+    def test_incremental_sync_advances_to_batch_max_revision_while_paginating(self):
+        _install_common_stubs()
+        sync_mod = importlib.import_module("app.dataplane.account.sync")
+        table_mod = importlib.import_module("app.dataplane.account.table")
+        models = importlib.import_module("app.control.account.models")
+
+        table = table_mod.make_empty_table()
+        calls = []
+
+        class _Repo:
+            async def scan_changes(self, since_revision, *, limit=5000):
+                calls.append(since_revision)
+                if len(calls) == 1:
+                    return models.AccountChangeSet(
+                        revision=100,
+                        batch_max_revision=7,
+                        has_more=True,
+                    )
+                return models.AccountChangeSet(revision=100, has_more=False)
+
+        changed = asyncio.run(sync_mod.apply_changes(table, _Repo()))
+
+        self.assertFalse(changed)
+        self.assertEqual(calls, [0, 7])
+        self.assertEqual(table.revision, 100)
+
+    def test_config_default_usage_concurrency_matches_sql_pool_capacity(self):
+        defaults = (REPO_ROOT / "config.defaults.toml").read_text(encoding="utf-8")
+        self.assertIn("usage_concurrency = 15", defaults)
 
     def test_redis_get_accounts_uses_pipeline(self):
         source = (REPO_ROOT / "app" / "control" / "account" / "backends" / "redis.py").read_text(
