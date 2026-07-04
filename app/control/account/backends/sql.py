@@ -767,7 +767,8 @@ class SqlAccountRepository:
                 if patch.clear_failures:
                     for k in ("cooldown_until", "cooldown_reason", "disabled_at",
                               "disabled_reason", "expired_at", "expired_reason",
-                              "forbidden_strikes", "console_429_count"):
+                              "forbidden_strikes", "console_429_count",
+                              "console_429_last_at"):
                         ext.pop(k, None)
                     updates["status"]           = AccountStatus.ACTIVE.value
                     updates["usage_fail_count"] = 0
@@ -980,6 +981,66 @@ class SqlAccountRepository:
                 {"reset_json": reset_json, "rev": rev, "now": now},
             )
             return int(result.rowcount or count)
+
+    async def recover_console_expired_accounts(self) -> int:
+        """Auto-recover console 429 expired accounts with successful history."""
+        await self._ensure_initialized()
+        now = now_ms()
+        recovery_threshold = now - 3600 * 1000
+
+        if self._dialect == "postgresql":
+            ext_expr = "(ext::jsonb)"
+            select_sql = sa.text(
+                "SELECT token, ext FROM accounts"
+                " WHERE status = 'expired'"
+                " AND deleted_at IS NULL"
+                " AND state_reason = 'console_429_threshold_exceeded'"
+                " AND usage_use_count > 5"
+                f" AND ({ext_expr}->>'expired_at')::bigint <= :threshold"
+            )
+        else:
+            select_sql = sa.text(
+                "SELECT token, ext FROM accounts"
+                " WHERE status = 'expired'"
+                " AND deleted_at IS NULL"
+                " AND state_reason = 'console_429_threshold_exceeded'"
+                " AND usage_use_count > 5"
+                " AND CAST(JSON_EXTRACT(ext, '$.expired_at') AS SIGNED) <= :threshold"
+            )
+
+        async with self._engine.begin() as conn:
+            rows = (await conn.execute(
+                select_sql,
+                {"threshold": recovery_threshold},
+            )).fetchall()
+            if not rows:
+                return 0
+            rev = await self._bump_revision(conn)
+            for row in rows:
+                mapping = row._mapping
+                try:
+                    ext = json.loads(mapping.get("ext") or "{}")
+                except (TypeError, ValueError):
+                    ext = {}
+                for ext_key in (
+                    "expired_at",
+                    "expired_reason",
+                    "console_429_count",
+                    "console_429_last_at",
+                ):
+                    ext.pop(ext_key, None)
+                await conn.execute(
+                    accounts_table.update()
+                    .where(accounts_table.c.token == mapping["token"])
+                    .values(
+                        status=AccountStatus.ACTIVE.value,
+                        state_reason=None,
+                        ext=json.dumps(ext),
+                        revision=rev,
+                        updated_at=now,
+                    )
+                )
+            return len(rows)
 
     async def close(self) -> None:
         """Dispose the SQLAlchemy connection pool."""

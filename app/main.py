@@ -245,8 +245,11 @@ async def lifespan(app: FastAPI):
         proxy_scheduler.start()
 
     console_reset_task: asyncio.Task | None = None
+    console_recovery_task: asyncio.Task | None = None
+    deleted_cleanup_task: asyncio.Task | None = None
     if is_leader:
         console_reset_interval = 30
+        console_recovery_interval = 600
 
         async def _console_reset_loop() -> None:
             while True:
@@ -258,8 +261,41 @@ async def lifespan(app: FastAPI):
                 except Exception as exc:
                     logger.debug("console quota reset loop error: error={}", exc)
 
+        async def _console_recovery_loop() -> None:
+            while True:
+                await asyncio.sleep(console_recovery_interval)
+                try:
+                    await refresh_svc.recover_console_expired_accounts()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug("console expired recovery loop error: error={}", exc)
+
         console_reset_task = asyncio.create_task(
             _console_reset_loop(), name="console-quota-reset"
+        )
+        console_recovery_task = asyncio.create_task(
+            _console_recovery_loop(), name="console-expired-recovery"
+        )
+
+        from app.control.account.cleanup import run_daily_deleted_account_cleanup
+
+        def _deleted_account_cleanup_settings() -> dict:
+            return {
+                "retention_days": _config.get_int(
+                    "account.cleanup.deleted_retention_days", 7
+                ),
+                "run_at": _config.get_str("account.cleanup.run_at", "03:30"),
+                "batch_size": _config.get_int("account.cleanup.batch_size", 5000),
+                "vacuum": _config.get_bool("account.cleanup.vacuum", False),
+            }
+
+        deleted_cleanup_task = asyncio.create_task(
+            run_daily_deleted_account_cleanup(
+                repo,
+                _deleted_account_cleanup_settings,
+            ),
+            name="deleted-account-cleanup",
         )
 
     logger.info("application startup completed")
@@ -273,6 +309,18 @@ async def lifespan(app: FastAPI):
         console_reset_task.cancel()
         try:
             await console_reset_task
+        except asyncio.CancelledError:
+            pass
+    if console_recovery_task is not None:
+        console_recovery_task.cancel()
+        try:
+            await console_recovery_task
+        except asyncio.CancelledError:
+            pass
+    if deleted_cleanup_task is not None:
+        deleted_cleanup_task.cancel()
+        try:
+            await deleted_cleanup_task
         except asyncio.CancelledError:
             pass
 

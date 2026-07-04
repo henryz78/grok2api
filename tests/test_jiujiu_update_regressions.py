@@ -385,6 +385,7 @@ class AccountRefreshBootstrapTests(unittest.TestCase):
         self.assertEqual(patch.usage_fail_delta, 1)
         self.assertEqual(patch.last_fail_reason, "rate_limited")
         self.assertEqual(patch.ext_merge["console_429_count"], 1)
+        self.assertIsInstance(patch.ext_merge["console_429_last_at"], int)
 
     def test_record_failure_async_console_429_uses_independent_counter(self):
         patches = []
@@ -422,6 +423,49 @@ class AccountRefreshBootstrapTests(unittest.TestCase):
         self.assertEqual(window.remaining, 10)
         self.assertIsNone(patch.status)
         self.assertEqual(patch.ext_merge["console_429_count"], 2)
+        self.assertIsInstance(patch.ext_merge["console_429_last_at"], int)
+
+    def test_record_failure_async_console_429_sliding_window_resets_old_counter(self):
+        patches = []
+        quota_set = self.quota_defaults.default_quota_set("basic")
+        assert quota_set.console is not None
+        quota_set.console.remaining = 20
+        record = self.models.AccountRecord(
+            token="tok-console-sliding",
+            pool="basic",
+            quota=quota_set.to_dict(),
+            ext={
+                "console_429_count": 2,
+                "console_429_last_at": 1_000,
+            },
+        )
+        upstream_error = importlib.import_module("app.platform.errors").UpstreamError(
+            "rate limited",
+            status=429,
+        )
+
+        class _Repo:
+            async def get_accounts(self, tokens):
+                return [record]
+
+            async def patch_accounts(self, account_patches):
+                patches.extend(account_patches)
+
+        async def _run():
+            original_now_ms = self.refresh_mod.now_ms
+            self.refresh_mod.now_ms = lambda: 1_000 + 13 * 3600 * 1000
+            try:
+                svc = self.refresh_mod.AccountRefreshService(_Repo())
+                await svc.record_failure_async("tok-console-sliding", 5, upstream_error)
+            finally:
+                self.refresh_mod.now_ms = original_now_ms
+
+        asyncio.run(_run())
+
+        self.assertEqual(len(patches), 1)
+        patch = patches[0]
+        self.assertEqual(patch.ext_merge["console_429_count"], 1)
+        self.assertIsNone(patch.status)
 
     def test_record_failure_async_console_429_expires_after_third_console_429(self):
         patches = []
@@ -459,7 +503,19 @@ class AccountRefreshBootstrapTests(unittest.TestCase):
         self.assertEqual(patch.status, self.enums.AccountStatus.EXPIRED)
         self.assertEqual(patch.state_reason, "console_429_threshold_exceeded")
         self.assertEqual(patch.ext_merge["console_429_count"], 3)
+        self.assertIsInstance(patch.ext_merge["console_429_last_at"], int)
         self.assertEqual(patch.ext_merge["expired_reason"], "console_429_threshold_exceeded")
+
+    def test_recover_console_expired_accounts_delegates_to_repository(self):
+        class _Repo:
+            async def recover_console_expired_accounts(self):
+                return 2
+
+        async def _run():
+            svc = self.refresh_mod.AccountRefreshService(_Repo())
+            return await svc.recover_console_expired_accounts()
+
+        self.assertEqual(asyncio.run(_run()), 2)
 
     def test_local_repository_bulk_resets_expired_console_windows(self):
         _install_common_stubs()
@@ -533,6 +589,7 @@ class AccountRefreshBootstrapTests(unittest.TestCase):
                             status=self.enums.AccountStatus.EXPIRED,
                             ext_merge={
                                 "console_429_count": 3,
+                                "console_429_last_at": 123,
                                 "expired_reason": "console_429_threshold_exceeded",
                             },
                         )
@@ -548,7 +605,68 @@ class AccountRefreshBootstrapTests(unittest.TestCase):
 
         self.assertEqual(record.status, self.enums.AccountStatus.ACTIVE)
         self.assertNotIn("console_429_count", record.ext)
+        self.assertNotIn("console_429_last_at", record.ext)
         self.assertNotIn("expired_reason", record.ext)
+
+    def test_local_repository_recovers_console_429_expired_accounts(self):
+        _install_common_stubs()
+        local_mod = importlib.import_module("app.control.account.backends.local")
+        commands = importlib.import_module("app.control.account.commands")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = local_mod.LocalAccountRepository(Path(tmpdir) / "accounts.db")
+            asyncio.run(repo.initialize())
+            asyncio.run(
+                repo.upsert_accounts(
+                    [
+                        commands.AccountUpsert(token="tok-recover"),
+                        commands.AccountUpsert(token="tok-low-use"),
+                    ]
+                )
+            )
+            old_expired_at = self.refresh_mod.now_ms() - 2 * 3600 * 1000
+            asyncio.run(
+                repo.patch_accounts(
+                    [
+                        commands.AccountPatch(
+                            token="tok-recover",
+                            status=self.enums.AccountStatus.EXPIRED,
+                            state_reason="console_429_threshold_exceeded",
+                            usage_use_delta=6,
+                            ext_merge={
+                                "console_429_count": 3,
+                                "console_429_last_at": old_expired_at,
+                                "expired_at": old_expired_at,
+                                "expired_reason": "console_429_threshold_exceeded",
+                            },
+                        ),
+                        commands.AccountPatch(
+                            token="tok-low-use",
+                            status=self.enums.AccountStatus.EXPIRED,
+                            state_reason="console_429_threshold_exceeded",
+                            usage_use_delta=5,
+                            ext_merge={
+                                "console_429_count": 3,
+                                "expired_at": old_expired_at,
+                                "expired_reason": "console_429_threshold_exceeded",
+                            },
+                        ),
+                    ]
+                )
+            )
+
+            count = asyncio.run(repo.recover_console_expired_accounts())
+            records = {
+                record.token: record
+                for record in asyncio.run(repo.get_accounts(["tok-recover", "tok-low-use"]))
+            }
+
+        self.assertEqual(count, 1)
+        self.assertEqual(records["tok-recover"].status, self.enums.AccountStatus.ACTIVE)
+        self.assertIsNone(records["tok-recover"].state_reason)
+        self.assertNotIn("console_429_count", records["tok-recover"].ext)
+        self.assertNotIn("console_429_last_at", records["tok-recover"].ext)
+        self.assertEqual(records["tok-low-use"].status, self.enums.AccountStatus.EXPIRED)
 
 
 class ConsoleQuotaSyncTests(unittest.TestCase):
@@ -577,6 +695,261 @@ class ConsoleQuotaSyncTests(unittest.TestCase):
 
 
 class StableJiujiuUpdateTests(unittest.TestCase):
+    def test_sqlite_wal_fallback_keeps_connection_usable(self):
+        _install_common_stubs()
+        local_mod = importlib.import_module("app.control.account.backends.local")
+
+        class _FakeConnection:
+            def __init__(self):
+                self.row_factory = None
+                self.executed: list[str] = []
+
+            def execute(self, sql, *args, **kwargs):
+                self.executed.append(str(sql))
+                if str(sql) == "PRAGMA journal_mode=WAL":
+                    raise local_mod.sqlite3.OperationalError("wal unsupported")
+                return self
+
+        fake = _FakeConnection()
+        original_connect = local_mod.sqlite3.connect
+        local_mod.sqlite3.connect = lambda *args, **kwargs: fake
+        try:
+            repo = local_mod.LocalAccountRepository(Path("dummy.db"))
+            self.assertIs(repo._connect(), fake)
+        finally:
+            local_mod.sqlite3.connect = original_connect
+
+        self.assertIn("PRAGMA journal_mode=WAL", fake.executed)
+        self.assertIn("PRAGMA busy_timeout=5000", fake.executed)
+
+    def test_console_expired_recovery_loop_is_wired(self):
+        source = (REPO_ROOT / "app" / "main.py").read_text(encoding="utf-8")
+
+        self.assertIn("console_recovery_interval = 600", source)
+        self.assertIn("await refresh_svc.recover_console_expired_accounts()", source)
+        self.assertIn('name="console-expired-recovery"', source)
+        self.assertIn("console_recovery_task.cancel()", source)
+
+    def test_deleted_account_cleanup_is_wired_with_safe_defaults(self):
+        defaults = (REPO_ROOT / "config.defaults.toml").read_text(encoding="utf-8")
+        config = (REPO_ROOT / "app" / "statics" / "admin" / "config.html").read_text(
+            encoding="utf-8"
+        )
+        main = (REPO_ROOT / "app" / "main.py").read_text(encoding="utf-8")
+
+        self.assertIn("[account.cleanup]", defaults)
+        self.assertIn("deleted_retention_days = 7", defaults)
+        self.assertIn('run_at = "03:30"', defaults)
+        self.assertIn("batch_size = 5000", defaults)
+        self.assertIn("vacuum = false", defaults)
+        self.assertIn("section: 'account.cleanup'", config)
+        self.assertIn("deleted_retention_days", config)
+        self.assertIn("max: 50000", config)
+        self.assertIn("run_daily_deleted_account_cleanup", main)
+        self.assertIn('name="deleted-account-cleanup"', main)
+        self.assertIn("deleted_cleanup_task.cancel()", main)
+
+    def test_deleted_account_cleanup_helpers(self):
+        _install_common_stubs()
+        cleanup_mod = importlib.import_module("app.control.account.cleanup")
+
+        now = 1_000_000_000
+        self.assertEqual(
+            cleanup_mod.cleanup_threshold_ms(now, 7),
+            now - 7 * 86_400_000,
+        )
+        self.assertGreater(
+            cleanup_mod.seconds_until_next_daily_run(
+                now_ms_value=now,
+                run_at="bad",
+            ),
+            0,
+        )
+
+        class _Repo:
+            pass
+
+        async def _run():
+            return await cleanup_mod.purge_deleted_accounts_once(
+                _Repo(),
+                retention_days=7,
+                batch_size=100,
+                vacuum=False,
+            )
+
+        result = asyncio.run(_run())
+        self.assertTrue(result.skipped)
+        self.assertEqual(result.reason, "repository_does_not_support_purge")
+
+    def test_local_repository_token_payloads_and_invalid_fast_path(self):
+        _install_common_stubs()
+        local_mod = importlib.import_module("app.control.account.backends.local")
+        commands = importlib.import_module("app.control.account.commands")
+        enums = importlib.import_module("app.control.account.enums")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = local_mod.LocalAccountRepository(Path(tmpdir) / "accounts.db")
+            asyncio.run(repo.initialize())
+            asyncio.run(
+                repo.upsert_accounts(
+                    [
+                        commands.AccountUpsert(token="tok-active", tags=["nsfw"]),
+                        commands.AccountUpsert(token="tok-expired"),
+                        commands.AccountUpsert(token="tok-disabled"),
+                    ]
+                )
+            )
+            asyncio.run(
+                repo.patch_accounts(
+                    [
+                        commands.AccountPatch(
+                            token="tok-active",
+                            usage_use_delta=3,
+                            usage_fail_delta=2,
+                            usage_sync_delta=1,
+                            last_fail_reason="rate_limited",
+                            quota_grok_4_3={"remaining": 8, "total": 10},
+                            ext_merge={"note": "keep-ui-field"},
+                        ),
+                        commands.AccountPatch(
+                            token="tok-expired",
+                            status=enums.AccountStatus.EXPIRED,
+                        ),
+                        commands.AccountPatch(
+                            token="tok-disabled",
+                            status=enums.AccountStatus.DISABLED,
+                        ),
+                    ]
+                )
+            )
+            items = asyncio.run(repo.list_token_payloads())
+            invalid = asyncio.run(repo.list_invalid_tokens())
+
+        by_token = {item["token"]: item for item in items}
+        active = by_token["tok-active"]
+        self.assertEqual(active["use_count"], 3)
+        self.assertEqual(active["fail_count"], 2)
+        self.assertEqual(active["sync_count"], 1)
+        self.assertEqual(active["last_fail_reason"], "rate_limited")
+        self.assertEqual(active["quota"]["grok_4_3"], {"remaining": 8, "total": 10})
+        self.assertEqual(active["tags"], ["nsfw"])
+        self.assertEqual(active["ext"], {"note": "keep-ui-field"})
+        self.assertEqual(invalid, ["tok-expired"])
+
+    def test_local_repository_purges_deleted_accounts_in_batches(self):
+        _install_common_stubs()
+        local_mod = importlib.import_module("app.control.account.backends.local")
+        commands = importlib.import_module("app.control.account.commands")
+        import sqlite3
+        from contextlib import closing
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "accounts.db"
+            repo = local_mod.LocalAccountRepository(db_path)
+            asyncio.run(repo.initialize())
+            asyncio.run(
+                repo.upsert_accounts(
+                    [
+                        commands.AccountUpsert(token="old-deleted-1"),
+                        commands.AccountUpsert(token="old-deleted-2"),
+                        commands.AccountUpsert(token="new-deleted"),
+                        commands.AccountUpsert(token="live-token"),
+                    ]
+                )
+            )
+            asyncio.run(
+                repo.delete_accounts(["old-deleted-1", "old-deleted-2", "new-deleted"])
+            )
+            cutoff = 2_000_000
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute(
+                    "UPDATE accounts SET deleted_at = ? WHERE token LIKE ?",
+                    (cutoff - 1, "old-deleted%"),
+                )
+                conn.execute(
+                    "UPDATE accounts SET deleted_at = ? WHERE token = ?",
+                    (cutoff + 1, "new-deleted"),
+                )
+                conn.commit()
+
+            purged = asyncio.run(
+                repo.purge_deleted_accounts(
+                    deleted_before_ms=cutoff,
+                    batch_size=1,
+                    vacuum=False,
+                )
+            )
+            with closing(sqlite3.connect(db_path)) as conn:
+                rows = {
+                    row[0]: row[1]
+                    for row in conn.execute(
+                        "SELECT token, deleted_at FROM accounts ORDER BY token"
+                    )
+                }
+
+        self.assertEqual(purged, 2)
+        self.assertNotIn("old-deleted-1", rows)
+        self.assertNotIn("old-deleted-2", rows)
+        self.assertIsNotNone(rows["new-deleted"])
+        self.assertIsNone(rows["live-token"])
+
+    def test_admin_tokens_uses_fast_list_paths(self):
+        tokens_mod = _load_admin_tokens_module()
+
+        class _FastRepo:
+            def __init__(self):
+                self.list_called = False
+
+            async def list_token_payloads(self):
+                return [
+                    {
+                        "token": "tok-fast",
+                        "pool": "basic",
+                        "status": "active",
+                        "quota": {},
+                        "use_count": 0,
+                        "fail_count": 0,
+                        "sync_count": 0,
+                        "last_used_at": None,
+                        "tags": [],
+                        "ext": {},
+                    }
+                ]
+
+            async def list_accounts(self, _query):
+                self.list_called = True
+                raise AssertionError("list_tokens should use compact payloads")
+
+        repo = _FastRepo()
+        body = json.loads(asyncio.run(tokens_mod.list_tokens(repo)).body.decode("utf-8"))
+
+        self.assertFalse(repo.list_called)
+        self.assertEqual(body["tokens"][0]["token"], "tok-fast")
+
+        class _InvalidRepo:
+            def __init__(self):
+                self.deleted = []
+                self.payload_called = False
+
+            async def list_invalid_tokens(self):
+                return ["tok-expired"]
+
+            async def list_token_payloads(self):
+                self.payload_called = True
+                return []
+
+            async def delete_accounts(self, tokens):
+                self.deleted = list(tokens)
+
+        invalid_repo = _InvalidRepo()
+        body = json.loads(
+            asyncio.run(tokens_mod.delete_invalid_tokens(invalid_repo)).body.decode("utf-8")
+        )
+
+        self.assertFalse(invalid_repo.payload_called)
+        self.assertEqual(invalid_repo.deleted, ["tok-expired"])
+        self.assertEqual(body, {"deleted": 1})
+
     def _runtime_table_for_selection(self):
         _install_common_stubs()
         table_mod = importlib.import_module("app.dataplane.account.table")

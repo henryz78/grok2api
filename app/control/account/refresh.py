@@ -445,13 +445,20 @@ class AccountRefreshService:
                                 synced_at=window.synced_at,
                                 source=QuotaSource.ESTIMATED,
                             ).to_dict()
-                            console_429_count = int(
-                                (record.ext or {}).get("console_429_count", 0)
-                            )
+                            ext_data = record.ext or {}
+                            last_429_at = int(ext_data.get("console_429_last_at", 0) or 0)
+                            sliding_window_ms = 12 * 3600 * 1000
+                            if last_429_at > 0 and (now - last_429_at) > sliding_window_ms:
+                                console_429_count = 0
+                            else:
+                                console_429_count = int(
+                                    ext_data.get("console_429_count", 0) or 0
+                                )
                             new_429_count = console_429_count + 1
                             ext_merge: dict = {
-                                **(record.ext or {}),
+                                **ext_data,
                                 "console_429_count": new_429_count,
+                                "console_429_last_at": now,
                             }
                             if new_remaining <= 0 and new_429_count >= 3:
                                 extra_patch["status"] = AccountStatus.EXPIRED
@@ -617,6 +624,13 @@ class AccountRefreshService:
         count = await self._repo.reset_expired_console_windows()
         if count > 0:
             logger.debug("console quota windows auto-reset: count={}", count)
+        return count
+
+    async def recover_console_expired_accounts(self) -> int:
+        """Auto-recover console 429 expired accounts that have successful history."""
+        count = await self._repo.recover_console_expired_accounts()
+        if count > 0:
+            logger.info("console expired accounts auto-recovered: count={}", count)
         return count
 
 

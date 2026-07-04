@@ -83,6 +83,10 @@ class AccountRepository(Protocol):
         """Batch-reset local console quota windows that can recover."""
         ...
 
+    async def recover_console_expired_accounts(self) -> int:
+        """Auto-recover console 429 expired accounts with successful history."""
+        ...
+
     async def close(self) -> None:
         """Release database connections / file handles."""
         ...

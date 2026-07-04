@@ -179,6 +179,36 @@ def _schedule_import_auto_nsfw(
     _fire_and_forget(_enable_nsfw_imported(repo, list(dict.fromkeys(tokens))))
 
 
+async def _list_all_records(repo: "AccountRepository") -> list:
+    items: list = []
+    page_num = 1
+    while True:
+        page = await repo.list_accounts(ListAccountsQuery(page=page_num, page_size=2000))
+        items.extend(page.items)
+        if page_num >= page.total_pages or not page.items:
+            break
+        page_num += 1
+    return items
+
+
+async def _list_token_payloads(repo: "AccountRepository") -> list[dict]:
+    fast_list = getattr(repo, "list_token_payloads", None)
+    if callable(fast_list):
+        return await fast_list()
+    return [_serialize_record(r) for r in await _list_all_records(repo)]
+
+
+async def _list_invalid_tokens(repo: "AccountRepository") -> list[str]:
+    fast_list = getattr(repo, "list_invalid_tokens", None)
+    if callable(fast_list):
+        return await fast_list()
+    return [
+        r.token
+        for r in await _list_all_records(repo)
+        if r.status == AccountStatus.EXPIRED
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -186,16 +216,7 @@ def _schedule_import_auto_nsfw(
 @router.get("/tokens")
 async def list_tokens(repo: "AccountRepository" = Depends(get_repo)):
     """Return flat token list."""
-    all_items: list = []
-    page_num = 1
-    while True:
-        page = await repo.list_accounts(ListAccountsQuery(page=page_num, page_size=2000))
-        all_items.extend(page.items)
-        if page_num >= page.total_pages or not page.items:
-            break
-        page_num += 1
-
-    return _json({"tokens": [_serialize_record(r) for r in all_items]})
+    return _json({"tokens": await _list_token_payloads(repo)})
 
 
 @router.post("/tokens")
@@ -301,14 +322,7 @@ async def delete_tokens(
 @router.delete("/tokens/invalid")
 async def delete_invalid_tokens(repo: "AccountRepository" = Depends(get_repo)):
     """Delete only explicitly expired accounts; cooling/disabled accounts are preserved."""
-    tokens: list[str] = []
-    page_num = 1
-    while True:
-        page = await repo.list_accounts(ListAccountsQuery(page=page_num, page_size=2000))
-        tokens.extend(r.token for r in page.items if r.status == AccountStatus.EXPIRED)
-        if page_num >= page.total_pages or not page.items:
-            break
-        page_num += 1
+    tokens = await _list_invalid_tokens(repo)
 
     if not tokens:
         return _json({"deleted": 0})

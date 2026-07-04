@@ -131,6 +131,15 @@ usage_concurrency = 15       # Keep default aligned with SQL pool_size(5)+max_ov
 on_demand_min_interval_sec = 300
 
 
+[account.cleanup]
+# 软删除账号保留天数；到期后由 leader worker 每日低峰分批物理删除。
+deleted_retention_days = 7
+run_at = "03:30"
+batch_size = 5000
+# 默认禁用，避免大库 VACUUM 长时间锁住 SQLite；需要回收空间时可在配置页打开。
+vacuum = false
+
+
 [account.selection]
 # 单号并发上限（两模式共用）
 max_inflight = 8

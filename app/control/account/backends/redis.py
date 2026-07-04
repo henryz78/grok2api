@@ -318,7 +318,8 @@ class RedisAccountRepository:
             if patch.clear_failures:
                 for k in ("cooldown_until", "cooldown_reason", "disabled_at",
                           "disabled_reason", "expired_at", "expired_reason",
-                          "forbidden_strikes", "console_429_count"):
+                          "forbidden_strikes", "console_429_count",
+                          "console_429_last_at"):
                     ext.pop(k, None)
                 updates["status"]           = AccountStatus.ACTIVE.value
                 updates["usage_fail_count"] = "0"
@@ -493,6 +494,66 @@ class RedisAccountRepository:
                 pipe.zadd(_KEY_REV_LOG, {token: rev})
             await pipe.execute()
         return len(to_reset)
+
+    async def recover_console_expired_accounts(self) -> int:
+        """Auto-recover console 429 expired accounts with successful history."""
+        now = now_ms()
+        recovery_threshold = now - 3600 * 1000
+        to_recover: list[tuple[str, dict[str, Any]]] = []
+
+        async for key_raw in self._r.scan_iter("accounts:record:*"):
+            key = key_raw.decode() if isinstance(key_raw, bytes) else key_raw
+            h = await self._r.hgetall(key)
+            if not h:
+                continue
+
+            def _s(k: str) -> str:
+                v = h.get(k) or h.get(k.encode())
+                return v.decode() if isinstance(v, bytes) else (v or "")
+
+            if _s("status") != AccountStatus.EXPIRED.value:
+                continue
+            if _s("deleted_at"):
+                continue
+            if _s("state_reason") != "console_429_threshold_exceeded":
+                continue
+            if int(_s("usage_use_count") or 0) <= 5:
+                continue
+            try:
+                ext = json.loads(_s("ext") or "{}")
+            except (TypeError, ValueError):
+                ext = {}
+            if int(ext.get("expired_at") or 0) > recovery_threshold:
+                continue
+            for ext_key in (
+                "expired_at",
+                "expired_reason",
+                "console_429_count",
+                "console_429_last_at",
+            ):
+                ext.pop(ext_key, None)
+            token = key.split(":", 2)[-1]
+            to_recover.append((token, ext))
+
+        if not to_recover:
+            return 0
+
+        rev = await self._bump_revision()
+        async with self._r.pipeline() as pipe:
+            for token, ext in to_recover:
+                pipe.hset(
+                    _record_key(token),
+                    mapping={
+                        "status": AccountStatus.ACTIVE.value,
+                        "state_reason": "",
+                        "ext": json.dumps(ext),
+                        "revision": str(rev),
+                        "updated_at": str(now),
+                    },
+                )
+                pipe.zadd(_KEY_REV_LOG, {token: rev})
+            await pipe.execute()
+        return len(to_recover)
 
     async def close(self) -> None:
         """Close the underlying Redis connection pool."""
