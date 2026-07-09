@@ -1211,6 +1211,15 @@ class StableJiujiuUpdateTests(unittest.TestCase):
         self.assertIn('"python-multipart>=0.0.31"', source)
         self.assertIn('"starlette>=1.1.0"', source)
 
+    def test_security_workflow_pins_pip_audit_python_313(self):
+        source = (REPO_ROOT / ".github" / "workflows" / "security.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("uses: actions/setup-python@v5", source)
+        self.assertIn('python-version: "3.13"', source)
+        self.assertIn("uvx --python 3.13 pip-audit", source)
+
     def test_console_multi_agent_native_tools_config_is_wired(self):
         chat = (REPO_ROOT / "app" / "products" / "openai" / "chat.py").read_text(encoding="utf-8")
         responses = (REPO_ROOT / "app" / "products" / "openai" / "responses.py").read_text(

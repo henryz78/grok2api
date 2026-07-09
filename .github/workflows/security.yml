@@ -49,9 +49,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
       - name: Install uv
         uses: astral-sh/setup-uv@v3
       - name: Export requirements
         run: uv export --frozen --no-dev --format requirements-txt -o /tmp/req.txt
       - name: Run pip-audit
-        run: uvx pip-audit -r /tmp/req.txt --progress-spinner off
+        run: uvx --python 3.13 pip-audit -r /tmp/req.txt --progress-spinner off
