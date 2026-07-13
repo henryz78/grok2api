@@ -101,6 +101,42 @@ docker compose restart grok2api
 docker compose down
 ```
 
+### Railway
+
+本仓库根目录包含 `Dockerfile` 与 `railway.toml`，连接 GitHub 仓库后 Railway 会直接使用 Dockerfile 构建，并使用 `/healthz` 执行健康检查。无需填写启动命令，生成域名时将 Target Port 设置为 `8000`。
+
+在 Railway 服务的 **Variables** 中至少设置：
+
+```dotenv
+GROK2API_JWT_SECRET=至少32字符的随机值
+GROK2API_CREDENTIAL_ENCRYPTION_KEY=Base64编码的32字节密钥
+GROK2API_BOOTSTRAP_ADMIN_USERNAME=admin
+GROK2API_BOOTSTRAP_ADMIN_PASSWORD=至少8字符的管理员密码
+```
+
+密钥可以在本地生成：
+
+```bash
+openssl rand -hex 32
+openssl rand -base64 32
+```
+
+`RAILWAY_PUBLIC_DOMAIN` 由 Railway 自动提供，应用会据此设置 `frontend.publicApiBaseURL` 并启用安全 Cookie。需要自定义域名时可显式设置：
+
+```dotenv
+GROK2API_PUBLIC_API_BASE_URL=https://grok.example.com
+```
+
+为持久化 SQLite、账号凭据、审计记录和媒体文件，请给服务添加 Railway Volume，挂载路径必须是：
+
+```text
+/app/data
+```
+
+`GROK2API_CREDENTIAL_ENCRYPTION_KEY` 在首次写入账号后必须永久保持不变，否则已有凭据将无法解密。首次管理员创建完成后可以删除 `GROK2API_BOOTSTRAP_ADMIN_PASSWORD`；数据库已有管理员时不会重复创建。
+
+原有 Docker Compose 的配置文件挂载方式仍然兼容；显式设置的 `GROK2API_*` 环境变量会覆盖对应启动配置。
+
 ### 源码运行
 
 后端：

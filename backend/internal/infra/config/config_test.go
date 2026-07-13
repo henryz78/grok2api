@@ -78,6 +78,35 @@ func TestDefaultGrokBuildClientVersionMatchesLocalBaseline(t *testing.T) {
 	}
 }
 
+func TestLoadAppliesRailwayEnvironmentOverridesWithoutConfigFile(t *testing.T) {
+	t.Setenv("GROK2API_JWT_SECRET", "railway-jwt-secret-12345678901234567890")
+	t.Setenv("GROK2API_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	t.Setenv("GROK2API_BOOTSTRAP_ADMIN_USERNAME", "railway-admin")
+	t.Setenv("GROK2API_BOOTSTRAP_ADMIN_PASSWORD", "railway-password")
+	t.Setenv("GROK2API_PUBLIC_API_BASE_URL", "")
+	t.Setenv("RAILWAY_PUBLIC_DOMAIN", "grok2api-production.up.railway.app")
+
+	cfg, err := Load(filepath.Join(t.TempDir(), "missing-config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Secrets.JWTSecret != "railway-jwt-secret-12345678901234567890" {
+		t.Fatalf("jwtSecret = %q", cfg.Secrets.JWTSecret)
+	}
+	if cfg.Secrets.CredentialEncryptionKey != "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" {
+		t.Fatalf("credentialEncryptionKey = %q", cfg.Secrets.CredentialEncryptionKey)
+	}
+	if cfg.BootstrapAdmin.Username != "railway-admin" || cfg.BootstrapAdmin.Password != "railway-password" {
+		t.Fatalf("bootstrapAdmin = %#v", cfg.BootstrapAdmin)
+	}
+	if cfg.Frontend.PublicAPIBaseURL != "https://grok2api-production.up.railway.app" {
+		t.Fatalf("publicApiBaseURL = %q", cfg.Frontend.PublicAPIBaseURL)
+	}
+	if !cfg.Auth.SecureCookies {
+		t.Fatal("Railway HTTPS domain did not enable secure cookies")
+	}
+}
+
 func TestLoadAcceptsRuntimeDefaultsAndRejectsUnknownFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	data := []byte(`secrets:

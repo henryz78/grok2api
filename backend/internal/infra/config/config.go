@@ -232,6 +232,7 @@ func Load(path string) (Config, error) {
 			}
 		}
 	}
+	applyEnvironmentOverrides(&cfg)
 	if loadedFrom != "" {
 		if err := resolveRelativePaths(&cfg, loadedFrom); err != nil {
 			return Config{}, err
@@ -241,6 +242,40 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// applyEnvironmentOverrides allows container platforms such as Railway to
+// provide startup values that should not be committed to config.yaml. File
+// configuration remains the base; explicitly defined
+// environment variables win.
+func applyEnvironmentOverrides(cfg *Config) {
+	if value, ok := os.LookupEnv("GROK2API_JWT_SECRET"); ok {
+		cfg.Secrets.JWTSecret = value
+	}
+	if value, ok := os.LookupEnv("GROK2API_CREDENTIAL_ENCRYPTION_KEY"); ok {
+		cfg.Secrets.CredentialEncryptionKey = value
+	}
+	if value, ok := os.LookupEnv("GROK2API_BOOTSTRAP_ADMIN_USERNAME"); ok {
+		cfg.BootstrapAdmin.Username = value
+	}
+	if value, ok := os.LookupEnv("GROK2API_BOOTSTRAP_ADMIN_PASSWORD"); ok {
+		cfg.BootstrapAdmin.Password = value
+	}
+
+	publicURL := strings.TrimSpace(os.Getenv("GROK2API_PUBLIC_API_BASE_URL"))
+	if publicURL == "" {
+		if domain := strings.TrimSpace(os.Getenv("RAILWAY_PUBLIC_DOMAIN")); domain != "" {
+			if strings.Contains(domain, "://") {
+				publicURL = domain
+			} else {
+				publicURL = "https://" + domain
+			}
+		}
+	}
+	if publicURL != "" {
+		cfg.Frontend.PublicAPIBaseURL = publicURL
+		cfg.Auth.SecureCookies = strings.HasPrefix(strings.ToLower(publicURL), "https://")
+	}
 }
 
 func resolveRelativePaths(cfg *Config, configPath string) error {
