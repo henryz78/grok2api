@@ -197,12 +197,15 @@ func TestAccountRepositoryLinksWebAndBuildAccountsOnce(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	consoleCandidates, err := repo.ListMissingConsoleSyncAccounts(ctx, []uint64{web.ID, build.ID, unlinkedWeb.ID})
+	consoleCandidates, err := repo.ListMissingConsoleSyncAccounts(ctx, []uint64{web.ID, unlinkedWeb.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(consoleCandidates) != 2 || consoleCandidates[0].ID != build.ID || consoleCandidates[1].ID != unlinkedWeb.ID {
+	if len(consoleCandidates) != 1 || consoleCandidates[0].ID != unlinkedWeb.ID {
 		t.Fatalf("console sync candidates = %#v", consoleCandidates)
+	}
+	if _, err := repo.ListMissingConsoleSyncAccounts(ctx, []uint64{build.ID}); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("non-web console candidate error = %v", err)
 	}
 	if _, err := repo.ListMissingConsoleSyncAccounts(ctx, []uint64{web.ID, 999_999}); !errors.Is(err, repository.ErrNotFound) {
 		t.Fatalf("missing console candidate error = %v", err)
@@ -213,13 +216,6 @@ func TestAccountRepositoryLinksWebAndBuildAccountsOnce(t *testing.T) {
 	}
 	if consoleTotal != 1 || consoleSkipped != 1 || len(consoleBatch) != 1 || consoleBatch[0].ID != unlinkedWeb.ID {
 		t.Fatalf("console sync batch = %#v, total = %d, skipped = %d", consoleBatch, consoleTotal, consoleSkipped)
-	}
-	webSourceKeys, err := repo.ListAccountSourceKeys(ctx, account.ProviderWeb)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(webSourceKeys) != 2 || webSourceKeys[0] != "web" || webSourceKeys[1] != "web-2" {
-		t.Fatalf("web source keys = %#v", webSourceKeys)
 	}
 	otherBuild, _, err := repo.UpsertByIdentity(ctx, account.Credential{Provider: account.ProviderBuild, Name: "build-2", SourceKey: "build-2", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive})
 	if err != nil {
@@ -642,7 +638,7 @@ func TestFreshSchemaContract(t *testing.T) {
 		}
 	}
 	assertTableColumns(t, database, "provider_accounts", []string{"provider", "source_key", "auth_status"}, []string{"oidc_client_id", "expires_at", "encrypted_access_token", "encrypted_refresh_token"})
-	assertTableColumns(t, database, "account_credentials", []string{"account_id", "auth_type", "client_id", "encrypted_primary", "encrypted_refresh", "expires_at", "refresh_due_at", "last_refresh_at", "refresh_failures", "last_refresh_error"}, nil)
+	assertTableColumns(t, database, "account_credentials", []string{"account_id", "auth_type", "client_id", "encrypted_primary", "encrypted_refresh", "expires_at", "refresh_due_at", "last_refresh_at", "refresh_failures", "last_refresh_error", "refresh_permanent"}, nil)
 	assertTableColumns(t, database, "admin_sessions", nil, []string{"revoked_at"})
 	assertTableColumns(t, database, "account_model_capabilities", []string{"account_id", "upstream_model"}, []string{"provider", "synced_at"})
 	assertTableColumns(t, database, "request_audits", []string{"media_input_images", "media_output_images", "media_output_seconds"}, nil)

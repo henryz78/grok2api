@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
@@ -33,6 +32,8 @@ var (
 	ErrConversionBusy = errors.New("账号正在转换为 Grok Build")
 )
 
+var ErrCredentialRefreshPermanent = errors.New("OAuth refresh token 已永久失效")
+
 const (
 	estimatedFreeTokenLimit     int64         = 1_000_000
 	freeUsageWindow             time.Duration = 24 * time.Hour
@@ -51,9 +52,10 @@ const (
 	credentialImportChunkSize                 = 100
 	maxBuildConversionAccounts                = 1000
 	maxWebConsoleSyncAccounts                 = 1000
-	defaultAccountTaskBatchSize               = 1000
-	maxAccountTaskBatchSize                   = 1000
+	accountTaskBatchSize                      = 1000
 )
+
+const permanentRefreshExpiredReason = "OAuth refresh token 已永久失效且 access token 已过期"
 
 type webQuotaRefreshState struct {
 	pending bool
@@ -240,7 +242,6 @@ type Service struct {
 	conversionPool        *batch.Pool
 	syncPool              *batch.Pool
 	refreshPool           *batch.Pool
-	accountTaskBatchSize  atomic.Int64
 	credentialRefreshWake chan struct{}
 	logger                *slog.Logger
 	now                   func() time.Time
@@ -251,7 +252,7 @@ func (s *Service) SetQuotaRecoveryQueue(queue repository.QuotaRecoveryQueue) {
 }
 
 func NewService(accounts repository.AccountRepository, audits repository.AuditRepository, deviceSessions repository.DeviceSessionRepository, sticky repository.StickySessionRepository, providers *provider.Registry, cipher *security.Cipher, refreshLock repository.DistributedLock) *Service {
-	service := &Service{
+	return &Service{
 		accounts: accounts, audits: audits, deviceSessions: deviceSessions, sticky: sticky,
 		providers: providers, cipher: cipher, refreshLock: refreshLock,
 		lastRefreshAt: make(map[uint64]time.Time), quotaRefreshes: make(map[string]*webQuotaRefreshState),
@@ -260,8 +261,6 @@ func NewService(accounts repository.AccountRepository, audits repository.AuditRe
 		conversionPool:        batch.NewPool(25), syncPool: batch.NewPool(25), refreshPool: batch.NewPool(25), logger: slog.Default(),
 		now: func() time.Time { return time.Now().UTC() },
 	}
-	service.accountTaskBatchSize.Store(defaultAccountTaskBatchSize)
-	return service
 }
 
 func (s *Service) SetBulkPool(pool *batch.Pool) {
@@ -281,23 +280,6 @@ func (s *Service) SetTaskPools(conversion, syncPool, refresh *batch.Pool) {
 	if refresh != nil {
 		s.refreshPool = refresh
 	}
-}
-
-// UpdateAccountTaskBatchSize 热更新“全部”账号任务每次从仓储获取的账号数量。
-func (s *Service) UpdateAccountTaskBatchSize(value int) {
-	if value < 1 {
-		value = defaultAccountTaskBatchSize
-	}
-	value = min(value, maxAccountTaskBatchSize)
-	s.accountTaskBatchSize.Store(int64(value))
-}
-
-func (s *Service) currentAccountTaskBatchSize() int {
-	value := s.accountTaskBatchSize.Load()
-	if value < 1 {
-		return defaultAccountTaskBatchSize
-	}
-	return int(value)
 }
 
 func (s *Service) SetLogger(logger *slog.Logger) {
@@ -809,7 +791,7 @@ func (s *Service) SyncAllWebAccountsToConsoleWithStrategy(ctx context.Context, s
 	if strategy != WebConsoleSyncAll && strategy != WebConsoleSyncMissing {
 		return ImportResult{}, invalidInput("Grok Web 到 Console 同步策略无效")
 	}
-	batchSize := s.currentAccountTaskBatchSize()
+	batchSize := accountTaskBatchSize
 	result := ImportResult{AccountIDs: make([]uint64, 0)}
 	var afterID uint64
 	completed := 0
@@ -953,7 +935,7 @@ func (s *Service) ConvertAllWebAccountsToBuildWithStrategy(ctx context.Context, 
 	if strategy != BuildConversionAll && strategy != BuildConversionMissing {
 		return BuildConversionResult{}, invalidInput("Grok Web 到 Build 转换策略无效")
 	}
-	batchSize := s.currentAccountTaskBatchSize()
+	batchSize := accountTaskBatchSize
 	result := BuildConversionResult{BuildAccountIDs: make([]uint64, 0)}
 	seenBuildIDs := make(map[uint64]struct{})
 	var observed sync.Map
@@ -1312,6 +1294,9 @@ func (s *Service) ensureCredential(ctx context.Context, value accountdomain.Cred
 		return value, nil
 	}
 	now := s.now()
+	if credential, err, handled := s.resolvePermanentRefreshFailure(ctx, value, now, force); handled {
+		return credential, err
+	}
 	if !force && value.ExpiresAt.IsZero() && value.EncryptedAccessToken != "" {
 		return value, nil
 	}
@@ -1328,6 +1313,12 @@ func (s *Service) ensureCredential(ctx context.Context, value accountdomain.Cred
 			return nil, err
 		}
 		currentTime := s.now()
+		if credential, err, handled := s.resolvePermanentRefreshFailure(ctx, latest, currentTime, force); handled {
+			if err != nil {
+				return nil, err
+			}
+			return credential, nil
+		}
 		if respectSchedule && latest.RefreshDueAt != nil && latest.RefreshDueAt.After(currentTime) {
 			return latest, nil
 		}
@@ -1351,6 +1342,12 @@ func (s *Service) ensureCredential(ctx context.Context, value accountdomain.Cred
 				return nil, err
 			}
 			currentTime = s.now()
+			if credential, err, handled := s.resolvePermanentRefreshFailure(ctx, latest, currentTime, force); handled {
+				if err != nil {
+					return nil, err
+				}
+				return credential, nil
+			}
 			if respectSchedule && latest.RefreshDueAt != nil && latest.RefreshDueAt.After(currentTime) {
 				return latest, nil
 			}
@@ -1476,13 +1473,24 @@ func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential
 	} else if errors.Is(refreshErr, context.DeadlineExceeded) {
 		errorCode = "oauth_timeout"
 	}
+	// 永久失败只能由成功换取新 token 清除，后续偶发传输错误不能把状态降级为可重试。
+	permanent = permanent || credential.RefreshPermanent
 	now := s.now()
 	retryAt := now.Add(credentialRefreshBackoff(credential.ID, failureCount, retryAfter))
-	if permanent {
+	accessTokenAlive := credential.EncryptedAccessToken != "" && !credential.ExpiresAt.IsZero() && credential.ExpiresAt.After(now)
+	if permanent && accessTokenAlive {
+		// refresh token 已永久失效时，提前重试没有意义；到 access token 到期时再完成失效收敛。
+		retryAt = credential.ExpiresAt
+	} else if permanent {
 		retryAt = now
 	}
-	if err := s.accounts.UpdateCredentialRefreshFailure(ctx, credential.ID, failureCount, retryAt, errorCode); err != nil {
+	if err := s.accounts.UpdateCredentialRefreshFailure(ctx, credential.ID, failureCount, retryAt, errorCode, permanent); err != nil {
 		s.logger.Warn("credential_refresh_state_write_failed", "account_id", credential.ID, "error", err)
+	}
+	if permanent && accessTokenAlive {
+		s.logger.Warn("credential_refresh_permanent_but_token_alive", "account_id", credential.ID, "error_code", errorCode, "expires_at", credential.ExpiresAt, "retry_at", retryAt)
+		s.WakeCredentialRefresh()
+		return
 	}
 	if permanent {
 		if err := s.MarkReauthRequired(ctx, credential.ID, "OAuth refresh failed: "+errorCode); err != nil {
@@ -1492,6 +1500,26 @@ func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential
 	}
 	s.logger.Warn("credential_refresh_deferred", "account_id", credential.ID, "failure_count", failureCount, "retry_at", retryAt, "error_code", errorCode)
 	s.WakeCredentialRefresh()
+}
+
+// resolvePermanentRefreshFailure 阻止再次请求已确认失效的 refresh token，并在 access token 到期后收敛账号状态。
+func (s *Service) resolvePermanentRefreshFailure(ctx context.Context, credential accountdomain.Credential, now time.Time, force bool) (accountdomain.Credential, error, bool) {
+	if !credential.RefreshPermanent {
+		return accountdomain.Credential{}, nil, false
+	}
+	accessTokenAlive := credential.EncryptedAccessToken != "" && !credential.ExpiresAt.IsZero() && credential.ExpiresAt.After(now)
+	if accessTokenAlive && !force {
+		return credential, nil, true
+	}
+	if !accessTokenAlive {
+		if err := s.MarkReauthRequired(ctx, credential.ID, permanentRefreshExpiredReason); err != nil {
+			return accountdomain.Credential{}, err, true
+		}
+	}
+	if credential.LastRefreshErrorCode == "" {
+		return accountdomain.Credential{}, ErrCredentialRefreshPermanent, true
+	}
+	return accountdomain.Credential{}, fmt.Errorf("%w: %s", ErrCredentialRefreshPermanent, credential.LastRefreshErrorCode), true
 }
 
 func credentialRefreshBackoff(accountID uint64, failureCount int, retryAfter time.Duration) time.Duration {
@@ -1801,15 +1829,9 @@ func (s *Service) refreshQuotaMode(ctx context.Context, id uint64, mode string) 
 	var tier accountdomain.WebTier
 	quotaKind, _ := s.providers.QuotaKind(value.Provider)
 	if quotaKind == provider.QuotaRemoteWindow {
+		// 单模式核实只负责更新本次 429 对应的窗口。套餐判级由完整额度同步负责；
+		// 这里再次调用 SyncQuota 会重复请求当前模式，并额外访问其他额度端点。
 		tier = value.WebTier
-		if tier == "" || tier == accountdomain.WebTierAuto {
-			if snapshot, syncErr := adapter.SyncQuota(ctx, value); syncErr == nil {
-				tier = snapshot.Tier
-				_ = s.accounts.ReplaceQuotaWindows(ctx, id, snapshot.Tier, snapshot.SyncedAt, snapshot.Windows)
-			} else {
-				tier = accountdomain.WebTierBasic
-			}
-		}
 	}
 	now := time.Now().UTC()
 	if err := s.accounts.SaveQuotaWindows(ctx, id, tier, now, []accountdomain.QuotaWindow{window}); err != nil {
@@ -1890,6 +1912,17 @@ func (s *Service) RunWebQuotaRefresh(ctx context.Context) {
 
 func (s *Service) runWebQuotaRefresh(parent context.Context, request webQuotaRefreshRequest) {
 	for {
+		// Worker 开始前已经合并的重复请求由本轮远端快照覆盖。只有网络请求
+		// 进行期间再次到达的调用才需要尾随刷新，避免每个突发批次固定请求两次。
+		s.quotaRefreshMu.Lock()
+		state := s.quotaRefreshes[request.key]
+		if state == nil {
+			s.quotaRefreshMu.Unlock()
+			return
+		}
+		state.pending = false
+		s.quotaRefreshMu.Unlock()
+
 		ctx, cancel := context.WithTimeout(parent, webQuotaRefreshTimeout)
 		refreshMode := request.mode
 		if windows, err := s.accounts.GetQuotaWindows(ctx, []uint64{request.accountID}); err == nil {
@@ -1902,11 +1935,21 @@ func (s *Service) runWebQuotaRefresh(parent context.Context, request webQuotaRef
 		}
 		if refreshMode != "" {
 			var refreshErr error
-			if err := s.syncPool.Do(ctx, func(workCtx context.Context) error {
-				_, refreshErr = s.RefreshWebQuotaMode(workCtx, request.accountID, refreshMode)
-				return refreshErr
-			}); err != nil {
-				refreshErr = err
+			acquired := true
+			var release func()
+			if s.refreshLock != nil {
+				release, acquired, refreshErr = s.refreshLock.Acquire(ctx, "quota-refresh:"+request.key, webQuotaRefreshTimeout)
+			}
+			if refreshErr == nil && acquired {
+				if err := s.syncPool.Do(ctx, func(workCtx context.Context) error {
+					_, refreshErr = s.RefreshWebQuotaMode(workCtx, request.accountID, refreshMode)
+					return refreshErr
+				}); err != nil {
+					refreshErr = err
+				}
+			}
+			if release != nil {
+				release()
 			}
 			if refreshErr != nil && !errors.Is(refreshErr, context.Canceled) {
 				s.logger.Warn("web_quota_refresh_failed", "account_id", request.accountID, "mode", refreshMode, "error", refreshErr)
@@ -1915,7 +1958,7 @@ func (s *Service) runWebQuotaRefresh(parent context.Context, request webQuotaRef
 		cancel()
 
 		s.quotaRefreshMu.Lock()
-		state := s.quotaRefreshes[request.key]
+		state = s.quotaRefreshes[request.key]
 		if state != nil && state.pending {
 			state.pending = false
 			s.quotaRefreshMu.Unlock()
@@ -2126,7 +2169,7 @@ func (s *Service) runAccountBatch(ctx context.Context, operation string, ids []u
 
 func (s *Service) logBatchSummary(operation string, pool *batch.Pool, summary batch.Summary, err error) {
 	snapshot := pool.Snapshot()
-	s.logger.Info("account_bulk_completed", "operation", operation, "total", summary.Total, "submitted", summary.Submitted, "succeeded", summary.Succeeded, "failed", summary.Failed, "panicked", summary.Panicked, "duration_ms", summary.Duration.Milliseconds(), "canceled", summary.Canceled, "pool_limit", snapshot.Limit, "pool_active", snapshot.Active, "pool_peak", snapshot.Peak, "error", err)
+	s.logger.Info("account_bulk_completed", "operation", operation, "total", summary.Total, "submitted", summary.Submitted, "succeeded", summary.Succeeded, "failed", summary.Failed, "panicked", summary.Panicked, "duration_ms", summary.Duration.Milliseconds(), "canceled", summary.Canceled, "pool_limit", snapshot.Limit, "pool_active", snapshot.Active, "pool_queued", snapshot.Queued, "pool_peak", snapshot.Peak, "error", err)
 }
 
 func (s *Service) persistSeed(ctx context.Context, seed provider.CredentialSeed) (accountdomain.Credential, bool, error) {

@@ -123,15 +123,6 @@ func (r *AccountRepository) ListProviderAccountBatch(ctx context.Context, provid
 	return out, total, nil
 }
 
-func (r *AccountRepository) ListAccountSourceKeys(ctx context.Context, providerValue account.Provider) ([]string, error) {
-	var values []string
-	err := r.db.db.WithContext(ctx).Model(&accountModel{}).
-		Where("provider = ?", providerValue).
-		Order("id ASC").
-		Pluck("source_key", &values).Error
-	return values, err
-}
-
 func (r *AccountRepository) Summarize(ctx context.Context, now time.Time) ([]repository.AccountSummary, error) {
 	var rows []repository.AccountSummary
 	selectFields := `
@@ -347,7 +338,8 @@ func (r *AccountRepository) ListMissingConsoleSyncAccounts(ctx context.Context, 
 		return []account.Credential{}, nil
 	}
 	var existing int64
-	if err := r.db.db.WithContext(ctx).Model(&accountModel{}).Where("id IN ?", ids).Count(&existing).Error; err != nil {
+	if err := r.db.db.WithContext(ctx).Model(&accountModel{}).
+		Where("id IN ? AND provider = ?", ids, account.ProviderWeb).Count(&existing).Error; err != nil {
 		return nil, err
 	}
 	if existing != int64(len(ids)) {
@@ -356,8 +348,8 @@ func (r *AccountRepository) ListMissingConsoleSyncAccounts(ctx context.Context, 
 	var rows []accountModel
 	if err := r.db.db.WithContext(ctx).
 		Preload("Credential").Preload("WebProfile").
-		Where("id IN ?", ids).
-		Where("(provider <> ? OR "+missingConsoleAccountPredicate+")", account.ProviderWeb, account.ProviderConsole).
+		Where("id IN ? AND provider = ?", ids, account.ProviderWeb).
+		Where(missingConsoleAccountPredicate, account.ProviderConsole).
 		Order("id ASC").Find(&rows).Error; err != nil {
 		return nil, err
 	}
@@ -532,7 +524,7 @@ func (r *AccountRepository) UpsertManyByIdentity(ctx context.Context, values []a
 		if err := tx.Where("identity_key IN ?", identityKeys).Find(&existingRows).Error; err != nil {
 			return err
 		}
-		existingByIdentity := make(map[string]accountModel, len(existingRows)+len(values))
+		existingByIdentity := make(map[string]accountModel, len(values))
 		for _, row := range existingRows {
 			existingByIdentity[row.IdentityKey] = row
 		}
@@ -811,7 +803,7 @@ func (r *AccountRepository) UpdateTokens(ctx context.Context, id uint64, accessT
 	refreshDueAt := account.CredentialRefreshDueAt(id, expiresAt)
 	updates := map[string]any{
 		"encrypted_primary": accessToken, "expires_at": expiresAt, "refresh_due_at": refreshDueAt,
-		"last_refresh_at": now, "refresh_failures": 0, "last_refresh_error": "", "updated_at": now,
+		"last_refresh_at": now, "refresh_failures": 0, "last_refresh_error": "", "refresh_permanent": false, "updated_at": now,
 	}
 	if refreshToken != "" {
 		updates["encrypted_refresh"] = refreshToken
@@ -913,10 +905,10 @@ func (r *AccountRepository) NextCredentialRefreshDueAt(ctx context.Context) (*ti
 	return &value, nil
 }
 
-func (r *AccountRepository) UpdateCredentialRefreshFailure(ctx context.Context, id uint64, failureCount int, retryAt time.Time, errorCode string) error {
+func (r *AccountRepository) UpdateCredentialRefreshFailure(ctx context.Context, id uint64, failureCount int, retryAt time.Time, errorCode string, permanent bool) error {
 	return r.db.db.WithContext(ctx).Model(&accountCredentialModel{}).Where("account_id = ?", id).Updates(map[string]any{
 		"refresh_due_at": retryAt.UTC(), "refresh_failures": max(0, failureCount),
-		"last_refresh_error": truncate(errorCode, 100), "updated_at": time.Now().UTC(),
+		"last_refresh_error": truncate(errorCode, 100), "refresh_permanent": permanent, "updated_at": time.Now().UTC(),
 	}).Error
 }
 
