@@ -45,7 +45,7 @@ bootstrapAdmin:
 	if cfg.BootstrapAdmin.Username != "admin" || cfg.BootstrapAdmin.Password != "password123" {
 		t.Fatalf("bootstrapAdmin = %#v", cfg.BootstrapAdmin)
 	}
-	if cfg.Batch.ImportConcurrency != 25 || cfg.Batch.ConversionConcurrency != 25 || cfg.Batch.SyncConcurrency != 25 || cfg.Batch.RefreshConcurrency != 25 || cfg.Batch.RandomDelay.Value() != 500*time.Millisecond {
+	if cfg.Batch.AccountTaskBatchSize != 1000 || cfg.Batch.ImportConcurrency != 25 || cfg.Batch.ConversionConcurrency != 25 || cfg.Batch.SyncConcurrency != 25 || cfg.Batch.RefreshConcurrency != 25 || cfg.Batch.RandomDelay.Value() != 500*time.Millisecond {
 		t.Fatalf("batch defaults = %#v", cfg.Batch)
 	}
 	expectedDatabasePath := filepath.Join(dir, "data", "backend.db")
@@ -104,6 +104,13 @@ func TestLoadAppliesRailwayEnvironmentOverridesWithoutConfigFile(t *testing.T) {
 	}
 	if !cfg.Auth.SecureCookies {
 		t.Fatal("Railway HTTPS domain did not enable secure cookies")
+	}
+}
+
+func TestDefaultConsoleProviderConfig(t *testing.T) {
+	console := defaultConfig().Provider.Console
+	if console.BaseURL != "https://console.x.ai" || console.UserAgent == "" || console.ChatTimeout.Value() != 5*time.Minute {
+		t.Fatalf("console defaults = %#v", console)
 	}
 }
 
@@ -173,7 +180,13 @@ func TestValidateRejectsUnsafeRuntimeLimits(t *testing.T) {
 		"image size":   func(cfg *Config) { cfg.Media.MaxImageBytes = 33 << 20 },
 		"media total":  func(cfg *Config) { cfg.Media.MaxTotalBytes = 1 },
 		"batch limit":  func(cfg *Config) { cfg.Batch.SyncConcurrency = 51 },
+		"batch size":   func(cfg *Config) { cfg.Batch.AccountTaskBatchSize = 1001 },
 		"batch jitter": func(cfg *Config) { cfg.Batch.RandomDelay = Duration(6 * time.Second) },
+		"console url":  func(cfg *Config) { cfg.Provider.Console.BaseURL = "http://console.x.ai" },
+		"console ua":   func(cfg *Config) { cfg.Provider.Console.UserAgent = "" },
+		"console timeout": func(cfg *Config) {
+			cfg.Provider.Console.ChatTimeout = Duration(time.Second)
+		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -278,7 +291,7 @@ func TestValidateFrontendPublicAPIBaseURL(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.Secrets.JWTSecret = "12345678901234567890123456789012"
 	cfg.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-	for _, value := range []string{"", "127.0.0.1:8000", "ftp://example.com", "https://user@example.com", "https://example.com?token=value"} {
+	for _, value := range []string{"127.0.0.1:8000", "ftp://example.com", "https://user@example.com", "https://example.com?token=value"} {
 		cfg.Frontend.PublicAPIBaseURL = value
 		if err := cfg.Validate(); err == nil {
 			t.Fatalf("frontend.publicApiBaseURL %q was accepted", value)
@@ -288,5 +301,24 @@ func TestValidateFrontendPublicAPIBaseURL(t *testing.T) {
 	cfg.Auth.SecureCookies = true
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("valid frontend.publicApiBaseURL rejected: %v", err)
+	}
+}
+
+func TestEffectivePublicAPIBaseURLPriority(t *testing.T) {
+	cases := []struct {
+		name     string
+		frontend FrontendConfig
+		want     string
+	}{
+		{name: "runtime override", frontend: FrontendConfig{PublicAPIBaseURL: "https://yaml.example/base", PublicAPIBaseURLOverride: "https://runtime.example/api/"}, want: "https://runtime.example/api"},
+		{name: "yaml fallback", frontend: FrontendConfig{PublicAPIBaseURL: "https://yaml.example/base/"}, want: "https://yaml.example/base"},
+		{name: "local fallback", frontend: FrontendConfig{}, want: DefaultPublicAPIBaseURL},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.frontend.EffectivePublicAPIBaseURL(); got != tc.want {
+				t.Fatalf("EffectivePublicAPIBaseURL() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

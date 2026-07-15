@@ -61,8 +61,21 @@ type ServerConfig struct {
 }
 
 type FrontendConfig struct {
-	PublicAPIBaseURL string `yaml:"publicApiBaseURL"`
-	StaticPath       string `yaml:"staticPath"`
+	PublicAPIBaseURL         string `yaml:"publicApiBaseURL"`
+	PublicAPIBaseURLOverride string `yaml:"-"`
+	StaticPath               string `yaml:"staticPath"`
+}
+
+const DefaultPublicAPIBaseURL = "http://127.0.0.1:8000"
+
+// EffectivePublicAPIBaseURL 按运行设置、配置文件、内置默认值的顺序解析公开地址。
+func (c FrontendConfig) EffectivePublicAPIBaseURL() string {
+	for _, value := range []string{c.PublicAPIBaseURLOverride, c.PublicAPIBaseURL} {
+		if value = strings.TrimRight(strings.TrimSpace(value), "/"); value != "" {
+			return value
+		}
+	}
+	return DefaultPublicAPIBaseURL
 }
 
 type DatabaseConfig struct {
@@ -102,8 +115,9 @@ type AuthConfig struct {
 }
 
 type ProviderConfig struct {
-	Build BuildProviderConfig `yaml:"build"`
-	Web   WebProviderConfig   `yaml:"web"`
+	Build   BuildProviderConfig   `yaml:"build"`
+	Web     WebProviderConfig     `yaml:"web"`
+	Console ConsoleProviderConfig `yaml:"console"`
 }
 
 type BuildProviderConfig struct {
@@ -129,8 +143,15 @@ type WebProviderConfig struct {
 	RecoveryBackoffMax  Duration `yaml:"recoveryBackoffMax"`
 }
 
-// BatchConfig 定义可热加载的账号批量任务并发上限。
+type ConsoleProviderConfig struct {
+	BaseURL     string   `yaml:"baseURL"`
+	UserAgent   string   `yaml:"userAgent"`
+	ChatTimeout Duration `yaml:"chatTimeout"`
+}
+
+// BatchConfig 定义可热加载的账号批量任务边界。
 type BatchConfig struct {
+	AccountTaskBatchSize  int
 	ImportConcurrency     int
 	ConversionConcurrency int
 	SyncConcurrency       int
@@ -315,9 +336,22 @@ func (c Config) Validate() error {
 	if c.Server.RequestTimeout.Value() <= 0 || c.Server.RequestTimeout.Value() > maxRequestTimeout {
 		return errors.New("server.requestTimeout 必须大于零且不超过 24 小时")
 	}
-	publicAPIURL, err := url.ParseRequestURI(strings.TrimSpace(c.Frontend.PublicAPIBaseURL))
-	if err != nil || (publicAPIURL.Scheme != "http" && publicAPIURL.Scheme != "https") || publicAPIURL.Host == "" || publicAPIURL.User != nil || publicAPIURL.RawQuery != "" || publicAPIURL.Fragment != "" {
-		return errors.New("frontend.publicApiBaseURL 必须是不含凭据、查询参数和片段的 HTTP(S) URL")
+	for _, item := range []struct {
+		name  string
+		value string
+	}{
+		{name: "frontend.publicApiBaseURL", value: c.Frontend.PublicAPIBaseURL},
+		{name: "frontend.publicApiBaseURL 运行设置", value: c.Frontend.PublicAPIBaseURLOverride},
+	} {
+		if publicBase := strings.TrimSpace(item.value); publicBase != "" {
+			publicAPIURL, err := url.ParseRequestURI(publicBase)
+			if err != nil || (publicAPIURL.Scheme != "http" && publicAPIURL.Scheme != "https") || publicAPIURL.Host == "" || publicAPIURL.User != nil || publicAPIURL.RawQuery != "" || publicAPIURL.Fragment != "" {
+				return fmt.Errorf("%s 必须是不含凭据、查询参数和片段的 HTTP(S) URL", item.name)
+			}
+			if publicAPIURL.Scheme == "https" && !c.Auth.SecureCookies {
+				return errors.New("HTTPS 公共地址必须启用 auth.secureCookies")
+			}
+		}
 	}
 	switch c.Database.Driver {
 	case "sqlite":
@@ -379,9 +413,6 @@ func (c Config) Validate() error {
 	if isExampleSecret(c.BootstrapAdmin.Password) {
 		return errors.New("bootstrapAdmin.password 不能使用示例占位值")
 	}
-	if publicAPIURL.Scheme == "https" && !c.Auth.SecureCookies {
-		return errors.New("HTTPS 公共地址必须启用 auth.secureCookies")
-	}
 	if c.Auth.AccessTokenTTL.Value() <= 0 || c.Auth.RefreshTokenTTL.Value() <= 0 {
 		return errors.New("JWT 有效期必须大于零")
 	}
@@ -417,11 +448,24 @@ func (c Config) Validate() error {
 	if c.Provider.Web.MediaConcurrency < 1 || c.Provider.Web.MediaConcurrency > 64 {
 		return errors.New("provider.web 媒体并发必须在 1 到 64 之间")
 	}
+	consoleURL, err := url.ParseRequestURI(strings.TrimSpace(c.Provider.Console.BaseURL))
+	if err != nil || consoleURL.Scheme != "https" || consoleURL.Host == "" || consoleURL.User != nil {
+		return errors.New("provider.console.baseURL 必须是无凭据的 HTTPS URL")
+	}
+	if userAgent := strings.TrimSpace(c.Provider.Console.UserAgent); len(userAgent) < 1 || len(userAgent) > 512 {
+		return errors.New("provider.console.userAgent 长度必须在 1 到 512 个字符之间")
+	}
+	if c.Provider.Console.ChatTimeout.Value() < 5*time.Second || c.Provider.Console.ChatTimeout.Value() > 30*time.Minute {
+		return errors.New("provider.console.chatTimeout 必须在 5 秒到 30 分钟之间")
+	}
 	if c.Batch.ImportConcurrency < 1 || c.Batch.ImportConcurrency > 50 ||
 		c.Batch.ConversionConcurrency < 1 || c.Batch.ConversionConcurrency > 50 ||
 		c.Batch.SyncConcurrency < 1 || c.Batch.SyncConcurrency > 50 ||
 		c.Batch.RefreshConcurrency < 1 || c.Batch.RefreshConcurrency > 50 {
 		return errors.New("批量任务并发必须在 1 到 50 之间")
+	}
+	if c.Batch.AccountTaskBatchSize < 1 || c.Batch.AccountTaskBatchSize > 1000 {
+		return errors.New("全部账号任务每批数量必须在 1 到 1000 之间")
 	}
 	if c.Batch.RandomDelay.Value() < 0 || c.Batch.RandomDelay.Value() > 5*time.Second {
 		return errors.New("批量任务随机延迟必须在 0 到 5 秒之间")
@@ -449,7 +493,7 @@ func defaultConfig() Config {
 			ReadTimeout:    Duration(15 * time.Minute),
 			RequestTimeout: Duration(2 * time.Hour),
 		},
-		Frontend: FrontendConfig{PublicAPIBaseURL: "http://127.0.0.1:8000", StaticPath: "./frontend/dist"},
+		Frontend: FrontendConfig{PublicAPIBaseURL: DefaultPublicAPIBaseURL, StaticPath: "./frontend/dist"},
 		Database: DatabaseConfig{
 			Driver:   "sqlite",
 			SQLite:   SQLiteDatabaseConfig{Path: "./data/backend.db"},
@@ -477,9 +521,14 @@ func defaultConfig() Config {
 				MediaConcurrency: 4, RecoveryBackoffBase: Duration(30 * time.Second),
 				RecoveryBackoffMax: Duration(30 * time.Minute),
 			},
+			Console: ConsoleProviderConfig{
+				BaseURL: "https://console.x.ai", UserAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+				ChatTimeout: Duration(5 * time.Minute),
+			},
 		},
 		Batch: BatchConfig{
-			ImportConcurrency: 25, ConversionConcurrency: 25, SyncConcurrency: 25,
+			AccountTaskBatchSize: 1000,
+			ImportConcurrency:    25, ConversionConcurrency: 25, SyncConcurrency: 25,
 			RefreshConcurrency: 25, RandomDelay: Duration(500 * time.Millisecond),
 		},
 		Media: MediaConfig{

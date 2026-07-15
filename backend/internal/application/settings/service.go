@@ -49,8 +49,15 @@ type ProviderWebConfig struct {
 	RecoveryBackoffMax      string
 }
 
-// BatchConfig 是管理接口使用的批量任务并发输入。
+type ProviderConsoleConfig struct {
+	BaseURL     string
+	UserAgent   string
+	ChatTimeout string
+}
+
+// BatchConfig 是管理接口使用的批量任务输入。
 type BatchConfig struct {
+	AccountTaskBatchSize  int
 	ImportConcurrency     int
 	ConversionConcurrency int
 	SyncConcurrency       int
@@ -63,6 +70,11 @@ type MediaConfig struct {
 	MaxTotalBytes           int64
 	CleanupThresholdPercent int
 	CleanupInterval         string
+}
+
+// FrontendConfig 是管理接口使用的公开 API 地址输入。
+type FrontendConfig struct {
+	PublicAPIBaseURL string
 }
 
 // RoutingConfig 是管理接口使用的路由可编辑输入。
@@ -91,8 +103,10 @@ type ClientKeyDefaultsConfig struct {
 type EditableConfig struct {
 	ProviderBuild     ProviderBuildConfig
 	ProviderWeb       ProviderWebConfig
+	ProviderConsole   ProviderConsoleConfig
 	Batch             BatchConfig
 	Media             MediaConfig
+	Frontend          FrontendConfig
 	Routing           RoutingConfig
 	Audit             AuditConfig
 	ClientKeyDefaults ClientKeyDefaultsConfig
@@ -150,6 +164,13 @@ func (s *Service) Get() Snapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.snapshotLocked()
+}
+
+// PublicAPIBaseURL 返回运行设置、配置文件或内置默认值解析后的公开 API 根地址。
+func (s *Service) PublicAPIBaseURL() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg.Frontend.EffectivePublicAPIBaseURL()
 }
 
 // Update 校验并持久化运行设置，再原子替换进程内配置。
@@ -242,12 +263,23 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		MediaConcurrency: value.ProviderWeb.MediaConcurrency, AllowNSFW: value.ProviderWeb.AllowNSFW,
 		RecoveryBackoffBase: config.Duration(value.ProviderWeb.RecoveryBackoffBase), RecoveryBackoffMax: config.Duration(value.ProviderWeb.RecoveryBackoffMax),
 	}
+	if strings.TrimSpace(value.ProviderConsole.BaseURL) != "" {
+		base.Provider.Console = config.ConsoleProviderConfig{
+			BaseURL: value.ProviderConsole.BaseURL, UserAgent: value.ProviderConsole.UserAgent,
+			ChatTimeout: config.Duration(value.ProviderConsole.ChatTimeout),
+		}
+	}
 	randomDelay := time.Duration(-1)
 	if value.Batch.RandomDelay != nil {
 		randomDelay = *value.Batch.RandomDelay
 	}
+	accountTaskBatchSize := value.Batch.AccountTaskBatchSize
+	if accountTaskBatchSize <= 0 {
+		accountTaskBatchSize = base.Batch.AccountTaskBatchSize
+	}
 	base.Batch = config.BatchConfig{
-		ImportConcurrency: value.Batch.ImportConcurrency, ConversionConcurrency: value.Batch.ConversionConcurrency,
+		AccountTaskBatchSize: accountTaskBatchSize,
+		ImportConcurrency:    value.Batch.ImportConcurrency, ConversionConcurrency: value.Batch.ConversionConcurrency,
 		SyncConcurrency: value.Batch.SyncConcurrency, RefreshConcurrency: value.Batch.RefreshConcurrency,
 		RandomDelay: config.Duration(randomDelay),
 	}
@@ -255,6 +287,7 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	base.Media.MaxTotalBytes = value.Media.MaxTotalBytes
 	base.Media.CleanupThresholdPercent = value.Media.CleanupThresholdPercent
 	base.Media.CleanupInterval = config.Duration(value.Media.CleanupInterval)
+	base.Frontend.PublicAPIBaseURLOverride = strings.TrimSpace(value.Frontend.PublicAPIBaseURL)
 	base.Routing = config.RoutingConfig{
 		StickyTTL: config.Duration(value.Routing.StickyTTL), CooldownBase: config.Duration(value.Routing.CooldownBase),
 		CooldownMax: config.Duration(value.Routing.CooldownMax), CapacityWait: config.Duration(capacityWait), MaxAttempts: value.Routing.MaxAttempts,
@@ -285,14 +318,22 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 			MediaConcurrency: value.Provider.Web.MediaConcurrency, AllowNSFW: value.Provider.Web.AllowNSFW,
 			RecoveryBackoffBase: value.Provider.Web.RecoveryBackoffBase.Value(), RecoveryBackoffMax: value.Provider.Web.RecoveryBackoffMax.Value(),
 		},
+		ProviderConsole: settingsdomain.ProviderConsoleConfig{
+			BaseURL: value.Provider.Console.BaseURL, UserAgent: value.Provider.Console.UserAgent,
+			ChatTimeout: value.Provider.Console.ChatTimeout.Value(),
+		},
 		Batch: settingsdomain.BatchConfig{
-			ImportConcurrency: value.Batch.ImportConcurrency, ConversionConcurrency: value.Batch.ConversionConcurrency,
+			AccountTaskBatchSize: value.Batch.AccountTaskBatchSize,
+			ImportConcurrency:    value.Batch.ImportConcurrency, ConversionConcurrency: value.Batch.ConversionConcurrency,
 			SyncConcurrency: value.Batch.SyncConcurrency, RefreshConcurrency: value.Batch.RefreshConcurrency,
 			RandomDelay: &randomDelay,
 		},
 		Media: settingsdomain.MediaConfig{
 			MaxImageBytes: value.Media.MaxImageBytes, MaxTotalBytes: value.Media.MaxTotalBytes,
 			CleanupThresholdPercent: value.Media.CleanupThresholdPercent, CleanupInterval: value.Media.CleanupInterval.Value(),
+		},
+		Frontend: settingsdomain.FrontendConfig{
+			PublicAPIBaseURL: value.Frontend.PublicAPIBaseURLOverride,
 		},
 		Routing: settingsdomain.RoutingConfig{
 			StickyTTL: value.Routing.StickyTTL.Value(), CooldownBase: value.Routing.CooldownBase.Value(),
@@ -346,13 +387,21 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	}
 	next.Provider.Web.MediaConcurrency = input.ProviderWeb.MediaConcurrency
 	next.Provider.Web.AllowNSFW = input.ProviderWeb.AllowNSFW
+	next.Provider.Console.BaseURL = strings.TrimSpace(input.ProviderConsole.BaseURL)
+	next.Provider.Console.UserAgent = strings.TrimSpace(input.ProviderConsole.UserAgent)
+	accountTaskBatchSize := input.Batch.AccountTaskBatchSize
+	if accountTaskBatchSize <= 0 {
+		accountTaskBatchSize = current.Batch.AccountTaskBatchSize
+	}
 	next.Batch = config.BatchConfig{
-		ImportConcurrency: input.Batch.ImportConcurrency, ConversionConcurrency: input.Batch.ConversionConcurrency,
+		AccountTaskBatchSize: accountTaskBatchSize,
+		ImportConcurrency:    input.Batch.ImportConcurrency, ConversionConcurrency: input.Batch.ConversionConcurrency,
 		SyncConcurrency: input.Batch.SyncConcurrency, RefreshConcurrency: input.Batch.RefreshConcurrency,
 	}
 	next.Media.MaxImageBytes = input.Media.MaxImageBytes
 	next.Media.MaxTotalBytes = input.Media.MaxTotalBytes
 	next.Media.CleanupThresholdPercent = input.Media.CleanupThresholdPercent
+	next.Frontend.PublicAPIBaseURLOverride = strings.TrimSpace(input.Frontend.PublicAPIBaseURL)
 	next.Routing.MaxAttempts = input.Routing.MaxAttempts
 	next.Audit.BufferSize = input.Audit.BufferSize
 	next.Audit.BatchSize = input.Audit.BatchSize
@@ -375,6 +424,7 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 		{"providerWeb.videoTimeout", input.ProviderWeb.VideoTimeout, func(value config.Duration) { next.Provider.Web.VideoTimeout = value }},
 		{"providerWeb.recoveryBackoffBase", input.ProviderWeb.RecoveryBackoffBase, func(value config.Duration) { next.Provider.Web.RecoveryBackoffBase = value }},
 		{"providerWeb.recoveryBackoffMax", input.ProviderWeb.RecoveryBackoffMax, func(value config.Duration) { next.Provider.Web.RecoveryBackoffMax = value }},
+		{"providerConsole.chatTimeout", input.ProviderConsole.ChatTimeout, func(value config.Duration) { next.Provider.Console.ChatTimeout = value }},
 		{"media.cleanupInterval", input.Media.CleanupInterval, func(value config.Duration) { next.Media.CleanupInterval = value }},
 		{"batch.randomDelay", input.Batch.RandomDelay, func(value config.Duration) { next.Batch.RandomDelay = value }},
 	}
@@ -407,14 +457,22 @@ func toEditable(cfg config.Config) EditableConfig {
 			MediaConcurrency: cfg.Provider.Web.MediaConcurrency, AllowNSFW: cfg.Provider.Web.AllowNSFW,
 			RecoveryBackoffBase: cfg.Provider.Web.RecoveryBackoffBase.String(), RecoveryBackoffMax: cfg.Provider.Web.RecoveryBackoffMax.String(),
 		},
+		ProviderConsole: ProviderConsoleConfig{
+			BaseURL: cfg.Provider.Console.BaseURL, UserAgent: cfg.Provider.Console.UserAgent,
+			ChatTimeout: cfg.Provider.Console.ChatTimeout.String(),
+		},
 		Batch: BatchConfig{
-			ImportConcurrency: cfg.Batch.ImportConcurrency, ConversionConcurrency: cfg.Batch.ConversionConcurrency,
+			AccountTaskBatchSize: cfg.Batch.AccountTaskBatchSize,
+			ImportConcurrency:    cfg.Batch.ImportConcurrency, ConversionConcurrency: cfg.Batch.ConversionConcurrency,
 			SyncConcurrency: cfg.Batch.SyncConcurrency, RefreshConcurrency: cfg.Batch.RefreshConcurrency,
 			RandomDelay: cfg.Batch.RandomDelay.String(),
 		},
 		Media: MediaConfig{
 			MaxImageBytes: cfg.Media.MaxImageBytes, MaxTotalBytes: cfg.Media.MaxTotalBytes,
 			CleanupThresholdPercent: cfg.Media.CleanupThresholdPercent, CleanupInterval: cfg.Media.CleanupInterval.String(),
+		},
+		Frontend: FrontendConfig{
+			PublicAPIBaseURL: cfg.Frontend.PublicAPIBaseURLOverride,
 		},
 		Routing: RoutingConfig{
 			StickyTTL: cfg.Routing.StickyTTL.String(), CooldownBase: cfg.Routing.CooldownBase.String(),

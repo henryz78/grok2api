@@ -6,11 +6,24 @@ import "time"
 type Config struct {
 	ProviderBuild     ProviderBuildConfig
 	ProviderWeb       ProviderWebConfig
+	ProviderConsole   ProviderConsoleConfig
 	Batch             BatchConfig
 	Media             MediaConfig
+	Frontend          FrontendConfig
 	Routing           RoutingConfig
 	Audit             AuditConfig
 	ClientKeyDefaults ClientKeyDefaultsConfig
+}
+
+// FrontendConfig 定义公开 API 地址的运行时覆盖值；留空时使用配置文件值。
+type FrontendConfig struct {
+	PublicAPIBaseURL string
+}
+
+type ProviderConsoleConfig struct {
+	BaseURL     string
+	UserAgent   string
+	ChatTimeout time.Duration
 }
 
 type MediaConfig struct {
@@ -35,8 +48,9 @@ type ProviderWebConfig struct {
 	RecoveryBackoffMax  time.Duration
 }
 
-// BatchConfig 定义账号导入、转换、同步和凭据刷新的并发上限。
+// BatchConfig 定义账号批量任务的取数与并发边界。
 type BatchConfig struct {
+	AccountTaskBatchSize  int
 	ImportConcurrency     int
 	ConversionConcurrency int
 	SyncConcurrency       int
