@@ -117,6 +117,10 @@ func accountIdentity(value account.Credential) string {
 	provider := string(value.Provider)
 	var identity string
 	switch {
+	case value.Provider == account.ProviderWeb && strings.TrimSpace(value.SourceKey) != "":
+		// SSO identity follows the imported session source. Enriching a Web
+		// account with email/user metadata must not create a duplicate row.
+		identity = strings.Join([]string{provider, "source", strings.TrimSpace(value.SourceKey)}, "|")
 	case strings.TrimSpace(value.UserID) != "":
 		identity = strings.Join([]string{provider, "user", strings.TrimSpace(value.UserID), strings.TrimSpace(value.TeamID)}, "|")
 	case strings.TrimSpace(value.Email) != "":

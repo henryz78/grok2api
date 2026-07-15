@@ -498,6 +498,13 @@ func (r *AccountRepository) UpsertByIdentity(ctx context.Context, value account.
 	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var err error
 		result, err = upsertAccountByIdentity(tx, value)
+		if err != nil {
+			return err
+		}
+		if value.Provider != account.ProviderWeb && value.Provider != account.ProviderBuild {
+			return nil
+		}
+		_, err = autoLinkWebBuildEmailGroups(tx, []string{value.Email})
 		return err
 	})
 	if err != nil {
@@ -514,8 +521,12 @@ func (r *AccountRepository) UpsertManyByIdentity(ctx context.Context, values []a
 	results := make([]repository.AccountUpsertResult, len(values))
 	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		identityKeys := make([]string, 0, len(values))
+		linkEmails := make([]string, 0, len(values))
 		for _, value := range values {
 			identityKeys = append(identityKeys, fromAccountDomain(value).IdentityKey)
+			if value.Provider == account.ProviderWeb || value.Provider == account.ProviderBuild {
+				linkEmails = append(linkEmails, value.Email)
+			}
 		}
 		var existingRows []accountModel
 		if err := tx.Where("identity_key IN ?", identityKeys).Find(&existingRows).Error; err != nil {
@@ -539,7 +550,8 @@ func (r *AccountRepository) UpsertManyByIdentity(ctx context.Context, values []a
 			results[index] = result
 			existingByIdentity[stored.IdentityKey] = stored
 		}
-		return nil
+		_, err := autoLinkWebBuildEmailGroups(tx, linkEmails)
+		return err
 	})
 	if err != nil {
 		return nil, mapError(err)
@@ -602,6 +614,128 @@ func upsertKnownAccountByIdentity(tx *gorm.DB, value account.Credential, existin
 		return repository.AccountUpsertResult{}, accountModel{}, err
 	}
 	return repository.AccountUpsertResult{ID: row.ID, Created: true}, row, nil
+}
+
+// ReconcileWebBuildLinksByEmail fills missing one-to-one Web/Build links for
+// existing accounts. Ambiguous email groups and conflicting links are skipped.
+func (r *AccountRepository) ReconcileWebBuildLinksByEmail(ctx context.Context) (int64, error) {
+	var linked int64
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var values []accountModel
+		if err := tx.Select("id", "provider", "email", "team_id").
+			Where("provider IN ? AND TRIM(email) <> ?", []string{string(account.ProviderWeb), string(account.ProviderBuild)}, "").
+			Order("id ASC").
+			Find(&values).Error; err != nil {
+			return err
+		}
+		var err error
+		linked, err = autoLinkWebBuildEmailRows(tx, values)
+		return err
+	})
+	return linked, mapError(err)
+}
+
+func autoLinkWebBuildEmailGroups(tx *gorm.DB, rawEmails []string) (int64, error) {
+	emails := make([]string, 0, len(rawEmails))
+	seen := make(map[string]struct{}, len(rawEmails))
+	for _, rawEmail := range rawEmails {
+		email := strings.ToLower(strings.TrimSpace(rawEmail))
+		if email == "" {
+			continue
+		}
+		if _, exists := seen[email]; exists {
+			continue
+		}
+		seen[email] = struct{}{}
+		emails = append(emails, email)
+	}
+	if len(emails) == 0 {
+		return 0, nil
+	}
+	var values []accountModel
+	if err := tx.Select("id", "provider", "email", "team_id").
+		Where("provider IN ? AND LOWER(TRIM(email)) IN ?", []string{string(account.ProviderWeb), string(account.ProviderBuild)}, emails).
+		Order("id ASC").
+		Find(&values).Error; err != nil {
+		return 0, err
+	}
+	return autoLinkWebBuildEmailRows(tx, values)
+}
+
+// autoLinkWebBuildEmailRows links only unambiguous one-Web/one-Build email
+// groups. Existing links are preserved, and conflicting Team IDs block linking.
+func autoLinkWebBuildEmailRows(tx *gorm.DB, values []accountModel) (int64, error) {
+	type emailGroup struct {
+		webAccounts   []accountModel
+		buildAccounts []accountModel
+	}
+	groups := make(map[string]*emailGroup)
+	for _, value := range values {
+		email := strings.ToLower(strings.TrimSpace(value.Email))
+		if email == "" {
+			continue
+		}
+		group := groups[email]
+		if group == nil {
+			group = &emailGroup{}
+			groups[email] = group
+		}
+		switch account.Provider(value.Provider) {
+		case account.ProviderWeb:
+			group.webAccounts = append(group.webAccounts, value)
+		case account.ProviderBuild:
+			group.buildAccounts = append(group.buildAccounts, value)
+		}
+	}
+
+	candidates := make([]accountProviderLinkModel, 0, len(groups))
+	webIDs := make([]uint64, 0, len(groups))
+	buildIDs := make([]uint64, 0, len(groups))
+	for _, group := range groups {
+		if len(group.webAccounts) != 1 || len(group.buildAccounts) != 1 {
+			continue
+		}
+		webAccount, buildAccount := group.webAccounts[0], group.buildAccounts[0]
+		webTeam, buildTeam := strings.TrimSpace(webAccount.TeamID), strings.TrimSpace(buildAccount.TeamID)
+		if webTeam != "" && buildTeam != "" && webTeam != buildTeam {
+			continue
+		}
+		candidates = append(candidates, accountProviderLinkModel{
+			WebAccountID: webAccount.ID, BuildAccountID: buildAccount.ID, CreatedAt: time.Now().UTC(),
+		})
+		webIDs = append(webIDs, webAccount.ID)
+		buildIDs = append(buildIDs, buildAccount.ID)
+	}
+	if len(candidates) == 0 {
+		return 0, nil
+	}
+
+	var links []accountProviderLinkModel
+	if err := tx.Where("web_account_id IN ? OR build_account_id IN ?", webIDs, buildIDs).Find(&links).Error; err != nil {
+		return 0, err
+	}
+	linkedWeb := make(map[uint64]struct{}, len(links))
+	linkedBuild := make(map[uint64]struct{}, len(links))
+	for _, link := range links {
+		linkedWeb[link.WebAccountID] = struct{}{}
+		linkedBuild[link.BuildAccountID] = struct{}{}
+	}
+
+	pending := make([]accountProviderLinkModel, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, exists := linkedWeb[candidate.WebAccountID]; exists {
+			continue
+		}
+		if _, exists := linkedBuild[candidate.BuildAccountID]; exists {
+			continue
+		}
+		pending = append(pending, candidate)
+	}
+	if len(pending) == 0 {
+		return 0, nil
+	}
+	result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&pending)
+	return result.RowsAffected, result.Error
 }
 
 func (r *AccountRepository) Update(ctx context.Context, value account.Credential) (account.Credential, error) {

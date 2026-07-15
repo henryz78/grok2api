@@ -230,6 +230,216 @@ func TestAccountRepositoryLinksWebAndBuildAccountsOnce(t *testing.T) {
 	}
 }
 
+func TestAccountRepositoryAutoLinksWebThenBuildByEmail(t *testing.T) {
+	ctx := context.Background()
+	repo := NewAccountRepository(openTestDatabase(t))
+	web, _, err := repo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "web", Email: "same@example.com",
+		SourceKey: "web-auto-link", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	build, _, err := repo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "build", Email: "same@example.com",
+		SourceKey: "build-auto-link", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertAccountLink(t, repo, web.ID, build.ID)
+}
+
+func TestAccountRepositoryAutoLinksBuildThenWebByCaseInsensitiveEmail(t *testing.T) {
+	ctx := context.Background()
+	repo := NewAccountRepository(openTestDatabase(t))
+	build, _, err := repo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "build", Email: " User@Example.COM ",
+		SourceKey: "build-first", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	web, _, err := repo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "web", Email: "user@example.com",
+		SourceKey: "web-second", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertAccountLink(t, repo, web.ID, build.ID)
+}
+
+func TestAccountRepositoryAutoLinksImportedBatchByEmail(t *testing.T) {
+	ctx := context.Background()
+	repo := NewAccountRepository(openTestDatabase(t))
+	results, err := repo.UpsertManyByIdentity(ctx, []account.Credential{
+		{
+			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "web", Email: "batch@example.com",
+			SourceKey: "batch-web", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+		},
+		{
+			Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "build", Email: "BATCH@example.com",
+			SourceKey: "batch-build", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("results = %#v", results)
+	}
+	assertAccountLink(t, repo, results[0].ID, results[1].ID)
+}
+
+func TestAccountRepositoryAutoLinkSkipsConflictingTeams(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	repo := NewAccountRepository(database)
+	if _, _, err := repo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "web", Email: "team@example.com", TeamID: "team-a",
+		SourceKey: "web-team-a", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "build", Email: "team@example.com", TeamID: "team-b",
+		SourceKey: "build-team-b", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count := tableRowCount(t, database, "account_provider_links"); count != 0 {
+		t.Fatalf("provider links = %d", count)
+	}
+}
+
+func TestAccountRepositoryAutoLinkSkipsAmbiguousEmailGroup(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	repo := NewAccountRepository(database)
+	for _, sourceKey := range []string{"web-ambiguous-1", "web-ambiguous-2"} {
+		if _, _, err := repo.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: sourceKey, Email: "ambiguous@example.com",
+			SourceKey: sourceKey, EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := repo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "build", Email: "ambiguous@example.com",
+		SourceKey: "build-ambiguous", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count := tableRowCount(t, database, "account_provider_links"); count != 0 {
+		t.Fatalf("provider links = %d", count)
+	}
+}
+
+func TestAccountRepositoryAutoLinkPreservesExistingManualLink(t *testing.T) {
+	ctx := context.Background()
+	repo := NewAccountRepository(openTestDatabase(t))
+	web, _, err := repo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "web", Email: "preserve@example.com",
+		SourceKey: "preserve-web", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manualBuild, _, err := repo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "manual-build", Email: "other@example.com",
+		SourceKey: "manual-build", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.LinkWebToBuild(ctx, web.ID, manualBuild.ID); err != nil {
+		t.Fatal(err)
+	}
+	matchingBuild, _, err := repo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "matching-build", Email: "preserve@example.com",
+		SourceKey: "matching-build", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertAccountLink(t, repo, web.ID, manualBuild.ID)
+	unlinked, err := repo.Get(ctx, matchingBuild.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unlinked.LinkedAccountID != 0 {
+		t.Fatalf("matching build link = %#v", unlinked)
+	}
+}
+
+func TestAccountRepositoryReconcilesExistingLinksByEmail(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	repo := NewAccountRepository(database)
+	web, _, err := repo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "web",
+		SourceKey: "legacy-web", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	build, _, err := repo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "build",
+		SourceKey: "legacy-build", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.WithContext(ctx).Model(&accountModel{}).
+		Where("id IN ?", []uint64{web.ID, build.ID}).
+		Update("email", "legacy@example.com").Error; err != nil {
+		t.Fatal(err)
+	}
+	linked, err := repo.ReconcileWebBuildLinksByEmail(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linked != 1 {
+		t.Fatalf("linked = %d", linked)
+	}
+	assertAccountLink(t, repo, web.ID, build.ID)
+	linked, err = repo.ReconcileWebBuildLinksByEmail(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linked != 0 {
+		t.Fatalf("idempotent linked = %d", linked)
+	}
+}
+
+func TestAccountRepositoryWebIdentityRemainsStableWhenEmailIsAdded(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	repo := NewAccountRepository(database)
+	created, wasCreated, err := repo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "web-before",
+		SourceKey: "stable-web-source", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil || !wasCreated {
+		t.Fatalf("create = %#v, %v, %v", created, wasCreated, err)
+	}
+	updated, wasCreated, err := repo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "web-after", Email: "stable@example.com",
+		UserID: "stable-user", TeamID: "stable-team", SourceKey: "stable-web-source",
+		EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil || wasCreated {
+		t.Fatalf("update = %#v, %v, %v", updated, wasCreated, err)
+	}
+	if updated.ID != created.ID || updated.Email != "stable@example.com" || updated.UserID != "stable-user" || updated.TeamID != "stable-team" {
+		t.Fatalf("updated account = %#v", updated)
+	}
+	if count := tableRowCount(t, database, "provider_accounts"); count != 1 {
+		t.Fatalf("provider accounts = %d", count)
+	}
+}
+
 func TestAccountRepositoryDecrementsQuotaByAmountAtomically(t *testing.T) {
 	ctx := context.Background()
 	repo := NewAccountRepository(openTestDatabase(t))
@@ -514,6 +724,24 @@ func tableRowCount(t *testing.T, database *Database, table string) int64 {
 		t.Fatal(err)
 	}
 	return count
+}
+
+func assertAccountLink(t *testing.T, repo *AccountRepository, webAccountID, buildAccountID uint64) {
+	t.Helper()
+	webAccount, err := repo.Get(context.Background(), webAccountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buildAccount, err := repo.Get(context.Background(), buildAccountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if webAccount.LinkedAccountID != buildAccountID || webAccount.LinkedProvider != account.ProviderBuild {
+		t.Fatalf("web link = %#v", webAccount)
+	}
+	if buildAccount.LinkedAccountID != webAccountID || buildAccount.LinkedProvider != account.ProviderWeb {
+		t.Fatalf("build link = %#v", buildAccount)
+	}
 }
 
 func testIdentityKey(source string) string {

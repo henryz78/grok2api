@@ -1,6 +1,7 @@
 package web
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -25,6 +26,9 @@ type importEntry struct {
 	SSOToken string `json:"sso_token"`
 	Token    string `json:"token"`
 	Tier     string `json:"tier"`
+	Email    string `json:"email"`
+	UserID   string `json:"user_id"`
+	TeamID   string `json:"team_id"`
 }
 
 func (a *Adapter) ParseImportedCredentials(data []byte) ([]provider.CredentialSeed, error) {
@@ -74,9 +78,13 @@ func (a *Adapter) ParseImportedCredentials(data []byte) ([]provider.CredentialSe
 		if name == "" {
 			name = fmt.Sprintf("Grok Web %s", security.HashToken(token)[:8])
 		}
+		claims := decodeSSOClaims(token)
 		result = append(result, provider.CredentialSeed{
 			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: tier,
-			Name: name, SourceKey: "sso:" + security.HashToken(token), AccessToken: token,
+			Name: name, Email: firstNonEmpty(entry.Email, claimString(claims, "email")),
+			UserID:    firstNonEmpty(entry.UserID, claimString(claims, "sub")),
+			TeamID:    firstNonEmpty(entry.TeamID, claimString(claims, "team_id")),
+			SourceKey: "sso:" + security.HashToken(token), AccessToken: token,
 		})
 	}
 	return result, nil
@@ -98,9 +106,12 @@ func parsePlainTextCredentials(value string) ([]provider.CredentialSeed, error) 
 			continue
 		}
 		seen[token] = struct{}{}
+		claims := decodeSSOClaims(token)
 		result = append(result, provider.CredentialSeed{
 			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierAuto,
-			Name: "Grok Web " + security.HashToken(token)[:8], SourceKey: "sso:" + security.HashToken(token), AccessToken: token,
+			Name:  "Grok Web " + security.HashToken(token)[:8],
+			Email: claimString(claims, "email"), UserID: claimString(claims, "sub"), TeamID: claimString(claims, "team_id"),
+			SourceKey: "sso:" + security.HashToken(token), AccessToken: token,
 		})
 		if len(result) > maxImportAccounts {
 			return nil, provider.ErrCredentialLimit
@@ -115,7 +126,10 @@ func parsePlainTextCredentials(value string) ([]provider.CredentialSeed, error) 
 func (a *Adapter) MarshalCredentials(values []provider.CredentialSeed) ([]byte, error) {
 	document := importDocument{Provider: string(account.ProviderWeb), Accounts: make([]importEntry, 0, len(values))}
 	for _, value := range values {
-		document.Accounts = append(document.Accounts, importEntry{Name: value.Name, SSOToken: value.AccessToken, Tier: string(value.WebTier)})
+		document.Accounts = append(document.Accounts, importEntry{
+			Name: value.Name, SSOToken: value.AccessToken, Tier: string(value.WebTier),
+			Email: value.Email, UserID: value.UserID, TeamID: value.TeamID,
+		})
 	}
 	data, err := json.MarshalIndent(document, "", "  ")
 	if err != nil {
@@ -137,9 +151,28 @@ func sanitizeSSOToken(value string) string {
 
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
+		if value = strings.TrimSpace(value); value != "" {
 			return value
 		}
 	}
 	return ""
+}
+
+// decodeSSOClaims extracts identity metadata from JWT-shaped SSO values.
+// The claims are used only for account display and conservative local linking;
+// upstream authentication remains the authority for whether the token is valid.
+func decodeSSOClaims(token string) map[string]any {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) < 2 {
+		return nil
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil
+	}
+	var claims map[string]any
+	if json.Unmarshal(payload, &claims) != nil {
+		return nil
+	}
+	return claims
 }
