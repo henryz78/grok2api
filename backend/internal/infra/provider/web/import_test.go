@@ -38,12 +38,15 @@ func TestParseImportedCredentialsRejectsOversizedPlainToken(t *testing.T) {
 
 func TestWebCredentialJSONUsesCurrentDocumentShape(t *testing.T) {
 	adapter := &Adapter{}
-	values, err := adapter.ParseImportedCredentials([]byte(`{"provider":"grok_web","accounts":[{"name":"primary","sso_token":"token-one","tier":"super","email":"user@example.com","user_id":"user-1","team_id":"team-1"}]}`))
+	values, err := adapter.ParseImportedCredentials([]byte(`{"provider":"grok_web","accounts":[{"name":"primary","sso_token":"token-one","tier":"super","email":"user@example.com","user_id":"user-1","team_id":"team-1","cloudflare_cookies":"cf_clearance=abc; sso=drop"}]}`))
 	if err != nil || len(values) != 1 || values[0].WebTier != account.WebTierSuper {
 		t.Fatalf("credentials = %#v, err = %v", values, err)
 	}
 	if values[0].Email != "user@example.com" || values[0].UserID != "user-1" || values[0].TeamID != "team-1" {
 		t.Fatalf("identity metadata = %#v", values[0])
+	}
+	if values[0].CloudflareCookies != "cf_clearance=abc; sso=drop" {
+		t.Fatalf("cloudflare cookies = %q", values[0].CloudflareCookies)
 	}
 	data, err := adapter.MarshalCredentials(values)
 	if err != nil {

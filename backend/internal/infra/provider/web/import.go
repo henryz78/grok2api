@@ -22,13 +22,14 @@ type importDocument struct {
 }
 
 type importEntry struct {
-	Name     string `json:"name"`
-	SSOToken string `json:"sso_token"`
-	Token    string `json:"token"`
-	Tier     string `json:"tier"`
-	Email    string `json:"email"`
-	UserID   string `json:"user_id"`
-	TeamID   string `json:"team_id"`
+	Name              string `json:"name"`
+	SSOToken          string `json:"sso_token"`
+	Token             string `json:"token"`
+	Tier              string `json:"tier"`
+	Email             string `json:"email"`
+	UserID            string `json:"user_id"`
+	TeamID            string `json:"team_id"`
+	CloudflareCookies string `json:"cloudflare_cookies"`
 }
 
 func (a *Adapter) ParseImportedCredentials(data []byte) ([]provider.CredentialSeed, error) {
@@ -85,6 +86,7 @@ func (a *Adapter) ParseImportedCredentials(data []byte) ([]provider.CredentialSe
 			UserID:    firstNonEmpty(entry.UserID, claimString(claims, "sub")),
 			TeamID:    firstNonEmpty(entry.TeamID, claimString(claims, "team_id")),
 			SourceKey: "sso:" + security.HashToken(token), AccessToken: token,
+			CloudflareCookies: entry.CloudflareCookies,
 		})
 	}
 	return result, nil
