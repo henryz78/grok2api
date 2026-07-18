@@ -88,7 +88,10 @@ func (s *LocalStore) CommitVideoUpload(ctx context.Context, tempPath, storageKey
 		return err
 	}
 	// 确保临时文件已落盘。
-	file, err := os.Open(tempPath)
+	// Windows 的 FlushFileBuffers 要求句柄具备写权限；只读打开后调用
+	// Sync 会返回 Access is denied。使用读写句柄，Linux 与 Windows 都能
+	// 保留提交前落盘语义。
+	file, err := os.OpenFile(tempPath, os.O_RDWR, 0)
 	if err != nil {
 		return fmt.Errorf("打开视频临时文件: %w", err)
 	}
