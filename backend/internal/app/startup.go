@@ -277,17 +277,6 @@ func (a *Application) reconcileStartup(ctx context.Context) {
 	recoveryCtx, cancel := context.WithTimeout(ctx, startupRecoveryBudget)
 	defer cancel()
 
-	if linker, ok := any(a.accountRepo).(interface {
-		ReconcileWebBuildLinksByEmail(context.Context) (int64, error)
-	}); ok {
-		linked, err := linker.ReconcileWebBuildLinksByEmail(recoveryCtx)
-		if err != nil {
-			a.logger.Warn("account_email_link_reconciliation_failed", "error", err)
-			a.startup.recordError(err)
-		} else if linked > 0 {
-			a.logger.Info("account_email_links_reconciled", "linked", linked)
-		}
-	}
 	if _, err := a.clientKeys.CleanupExpiredBilling(recoveryCtx, 1000); err != nil {
 		a.logger.Warn("billing_reservation_cleanup_failed", "error", err)
 		a.startup.recordError(err)
