@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -53,6 +54,7 @@ type Adapter struct {
 	uploadIssuer   VideoUploadIssuer
 	replay         *reasoningreplay.ReasoningReplay
 	compaction     *gatewayCompactionCodec
+	logger         *slog.Logger
 }
 
 func NewAdapter(cfg Config, cipher *security.Cipher) *Adapter {
@@ -63,7 +65,13 @@ func NewAdapter(cfg Config, cipher *security.Cipher) *Adapter {
 	agentID := uuid.NewString()
 	return &Adapter{
 		cfg: cfg, http: httpClient, oauth: newOAuthClient(httpClient), cipher: cipher, base: transport,
-		agentID: agentID, modelsETags: make(map[uint64]string), compaction: newGatewayCompactionCodec(cipher),
+		agentID: agentID, modelsETags: make(map[uint64]string), compaction: newGatewayCompactionCodec(cipher), logger: slog.Default(),
+	}
+}
+
+func (a *Adapter) SetLogger(logger *slog.Logger) {
+	if logger != nil {
+		a.logger = logger
 	}
 }
 
@@ -178,7 +186,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	if err := normalizeGzipResponse(resp); err != nil {
 		return nil, err
 	}
-	resp, reqURL, reasoningRecovered := a.recoverReasoningDecodeFailure(ctx, request, accessToken, body, base, resp, reqURL)
+	resp, reqURL, reasoningRecovery := a.recoverReasoningDecodeFailure(ctx, request, accessToken, body, base, replayKey, resp, reqURL)
 	// 仅可回退操作在当次 Build 主地址明确 403 时用等价请求探测 XAI。
 	if strings.EqualFold(base, primaryBase) && shouldProbeXAIInferenceFallback(request.Credential, request.Billing, request.Method, request.Path, resp.StatusCode) {
 		// 缓冲主 403 正文，备用失败时原样回放，避免二次 primary POST。
@@ -195,14 +203,14 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			if fallbackErr == nil {
 				fallbackErr = normalizeGzipResponse(fallbackResp)
 			}
-			fallbackRecovered := false
+			fallbackRecovery := reasoningRecoveryOutcome{}
 			if fallbackErr == nil {
-				fallbackResp, fallbackURL, fallbackRecovered = a.recoverReasoningDecodeFailure(ctx, request, accessToken, fallbackBody, fallbackBase, fallbackResp, fallbackURL)
+				fallbackResp, fallbackURL, fallbackRecovery = a.recoverReasoningDecodeFailure(ctx, request, accessToken, fallbackBody, fallbackBase, fallbackReplayKey, fallbackResp, fallbackURL)
 			}
 			if fallbackErr == nil && isHTTPSuccess(fallbackResp.StatusCode) {
 				a.activateBuildAPIFallback(ctx, &request.Credential)
 				resp, reqURL, base, body, replayKey = fallbackResp, fallbackURL, fallbackBase, fallbackBody, fallbackReplayKey
-				reasoningRecovered = reasoningRecovered || fallbackRecovered
+				reasoningRecovery = reasoningRecovery.merge(fallbackRecovery)
 			} else {
 				if fallbackErr == nil {
 					_ = fallbackResp.Body.Close()
@@ -225,9 +233,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			resp.Header.Set("X-Grok2API-Compatibility-Warnings", warnings)
 		}
 	}
-	if reasoningRecovered {
-		appendCompatibilityWarning(resp.Header, "reasoning_encrypted_content_downgraded")
-	}
+	reasoningRecovery.appendWarnings(resp.Header)
 	if responsesOperation && toolCompatibility != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		if request.Streaming {
 			resp.Body = toolCompatibility.normalizeResponseStream(resp.Body)
@@ -350,6 +356,7 @@ func (a *Adapter) doResponseRequest(ctx context.Context, request provider.Respon
 	if err := a.applyHeaders(req, request.Credential, accessToken, request.Model, request.PromptCacheKey, true); err != nil {
 		return nil, "", err
 	}
+	applyGrokTurnIndexHeader(req, request.GrokTurnIndex)
 	if len(body) > 0 {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -367,6 +374,34 @@ func (a *Adapter) doResponseRequest(ctx context.Context, request provider.Respon
 		return nil, "", err
 	}
 	return resp, req.URL.String(), nil
+}
+
+// applyGrokTurnIndexHeader 只在请求已有稳定 Grok session 时透传真实客户端轮次。
+func applyGrokTurnIndexHeader(request *http.Request, value string) {
+	if request.Header.Get("x-grok-session-id") == "" {
+		return
+	}
+	if turnIndex := normalizeGrokTurnIndex(value); turnIndex != "" {
+		request.Header.Set("x-grok-turn-idx", turnIndex)
+	}
+}
+
+// normalizeGrokTurnIndex 只接受官方客户端生成的非负十进制 u64。
+// 空值或非法值直接省略，避免网关根据历史、工具循环或 compact 结果伪造轮次。
+func normalizeGrokTurnIndex(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 20 {
+		return ""
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return ""
+		}
+	}
+	if _, err := strconv.ParseUint(value, 10, 64); err != nil {
+		return ""
+	}
+	return value
 }
 
 // invalidResponsesResponse 将本地协议校验错误转换为标准 OpenAI 错误响应，避免触发上游账号重试。

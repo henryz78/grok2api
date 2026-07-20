@@ -124,7 +124,7 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	clientService := clientkeyapp.NewService(nil, nil, nil, 60, 4, nil)
 	selector := NewSelector(accountRepo, concurrency, sticky, registry, time.Hour, time.Second, time.Minute)
 	service := NewService(modelRepo, auditRepo, accountService, clientService, registry, selector, responseRepo, 3)
-	result, err := service.CreateResponse(ctx, Input{RequestID: "req-1", ClientKey: clientKey, PublicModel: "grok-test", Body: []byte(`{"model":"grok-test"}`), PromptCacheSeed: "claude-session"})
+	result, err := service.CreateResponse(ctx, Input{RequestID: "req-1", ClientKey: clientKey, PublicModel: "grok-test", Body: []byte(`{"model":"grok-test"}`), PromptCacheSeed: "claude-session", GrokTurnIndex: "3"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,6 +147,9 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	}
 	if adapter.lastReasoningReplayKey != identity.replayKey {
 		t.Fatalf("reasoning replay key = %q, want %q", adapter.lastReasoningReplayKey, identity.replayKey)
+	}
+	if adapter.lastGrokTurnIndex != "3" {
+		t.Fatalf("Grok turn index = %q, want 3", adapter.lastGrokTurnIndex)
 	}
 	if boundID, ok, err := sticky.Get(ctx, stickySessionKey(identity.affinityKey), time.Now().UTC()); err != nil || !ok || boundID != second.ID {
 		t.Fatalf("failover sticky binding = %d, %v, err = %v; want account %d", boundID, ok, err, second.ID)
@@ -237,6 +240,31 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	missing.Finalize(Usage{}, "", "")
 	if _, err := responseRepo.Get(ctx, "resp-next", clientKey.ID, time.Now().UTC()); !errors.Is(err, repository.ErrNotFound) {
 		t.Fatalf("stale ownership err = %v", err)
+	}
+
+	adapter.resetAttempts()
+	streamFailed, err := service.CreateResponse(ctx, Input{RequestID: "req-stream-failed", ClientKey: clientKey, PublicModel: "grok-test", Body: []byte(`{"model":"grok-test"}`), PromptCacheSeed: "stream-failed-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(streamFailed.Body)
+	if streamFailed.RecordStreamFailure == nil {
+		t.Fatal("stream failure recorder is nil")
+	}
+	streamFailed.RecordStreamFailure(StreamFailureDiagnostic{Body: []byte(`{"type":"response.failed","error":{"message":"access_token=secret-token"}}`)})
+	streamFailed.Finalize(Usage{}, "", "upstream_stream_error")
+	_ = streamFailed.Body.Close()
+	logs, _, err = auditRepo.List(ctx, 0, 10)
+	if err != nil || len(logs) == 0 {
+		t.Fatalf("stream failure audits = %#v, err = %v", logs, err)
+	}
+	streamDetail, err := auditRepo.Get(ctx, logs[0].ID)
+	if err != nil || streamDetail.ErrorCode != "upstream_stream_error" || streamDetail.AttemptCount != 1 || len(streamDetail.Attempts) != 1 {
+		t.Fatalf("stream failure detail = %#v, err = %v", streamDetail, err)
+	}
+	streamAttempt := streamDetail.Attempts[0]
+	if streamAttempt.Stage != "response_stream" || streamAttempt.UpstreamStatusCode == nil || *streamAttempt.UpstreamStatusCode != http.StatusOK || string(streamAttempt.ResponseBody) != `{"type":"response.failed","error":{"message":"access_token=[REDACTED]"}}` {
+		t.Fatalf("stream failure attempt = %#v", streamAttempt)
 	}
 
 	adapter.resetAttempts()
@@ -1364,6 +1392,7 @@ type failoverAdapter struct {
 	lastPath               string
 	lastPromptCacheKey     string
 	lastReasoningReplayKey string
+	lastGrokTurnIndex      string
 	resourceStatus         int
 }
 
@@ -1720,6 +1749,7 @@ func (a *failoverAdapter) ForwardResponse(_ context.Context, request provider.Re
 	a.lastPath = request.Path
 	a.lastPromptCacheKey = request.PromptCacheKey
 	a.lastReasoningReplayKey = request.ReasoningReplayKey
+	a.lastGrokTurnIndex = request.GrokTurnIndex
 	resourceStatus := a.resourceStatus
 	a.mu.Unlock()
 	status, body := http.StatusOK, "ok"
@@ -1745,6 +1775,7 @@ func (a *failoverAdapter) resetAttempts() {
 	a.lastPath = ""
 	a.lastPromptCacheKey = ""
 	a.lastReasoningReplayKey = ""
+	a.lastGrokTurnIndex = ""
 }
 func (a *failoverAdapter) ListModels(context.Context, account.Credential) ([]string, error) {
 	return nil, nil
