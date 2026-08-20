@@ -8,11 +8,37 @@ import (
 
 // ResponseOptions 保留无法直接交给 Responses 上游执行的下游协议语义。
 type ResponseOptions struct {
-	AnthropicThinking          bool
+	AnthropicThinking bool
+	// ReasoningEffort is the effective client-facing Messages setting after
+	// budget and effort aliases have been converted to a canonical level.
+	ReasoningEffort            string
+	ReasoningEffortSet         bool
 	AnthropicWebSearch         bool
 	AnthropicWebSearchRequired bool
 	AnthropicWebSearchQuery    string
 	StopSequences              []string
+	// Include mirrors xAI Responses `include` (e.g. "no_inline_citations", "inline_citations").
+	Include []string
+	// InlineCitations overrides Include when non-nil.
+	InlineCitations *bool
+}
+
+// InlineCitationsEnabled reports whether [[N]](url) markers should be embedded.
+// Default is true (xAI Responses API default for HTTP clients).
+func (o ResponseOptions) InlineCitationsEnabled() bool {
+	if o.InlineCitations != nil {
+		return *o.InlineCitations
+	}
+	enabled := true
+	for _, item := range o.Include {
+		switch item {
+		case "no_inline_citations":
+			enabled = false
+		case "inline_citations":
+			enabled = true
+		}
+	}
+	return enabled
 }
 
 type responseEnvelope struct {

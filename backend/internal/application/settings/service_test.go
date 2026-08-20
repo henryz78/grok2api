@@ -58,6 +58,9 @@ func TestUpdatePersistsAppliesAndReportsRestart(t *testing.T) {
 	input.Frontend.PublicAPIBaseURL = "https://public.example.com"
 	input.ProviderConsole.BaseURL = "https://console.example.com"
 	input.ProviderConsole.ChatTimeout = "6m"
+	input.ProviderWeb.ClearanceProvided = true
+	input.ProviderWeb.ClearanceMode = config.ClearanceModeOnDemand
+	input.ProviderWeb.FlareSolverrURL = "http://flaresolverr:8191"
 	input.Batch = BatchConfig{ImportConcurrency: 26, ConversionConcurrency: 27, SyncConcurrency: 28, RefreshConcurrency: 29, RandomDelay: "750ms"}
 
 	snapshot, err := service.Update(context.Background(), service.Get().Revision, input)
@@ -85,6 +88,9 @@ func TestUpdatePersistsAppliesAndReportsRestart(t *testing.T) {
 	if applied.Provider.Console.BaseURL != "https://console.example.com" || applied.Provider.Console.ChatTimeout.Value() != 6*time.Minute {
 		t.Fatalf("console configuration was not applied: %#v", applied.Provider.Console)
 	}
+	if applied.Provider.Web.ClearanceMode != config.ClearanceModeOnDemand || applied.Provider.Web.FlareSolverrURL != "http://flaresolverr:8191" {
+		t.Fatalf("on-demand Clearance configuration was not applied: %#v", applied.Provider.Web)
+	}
 	if len(snapshot.RestartRequired) != 1 || snapshot.RestartRequired[0] != "audit.bufferSize" {
 		t.Fatalf("restartRequired = %#v", snapshot.RestartRequired)
 	}
@@ -92,7 +98,7 @@ func TestUpdatePersistsAppliesAndReportsRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reloaded.Server.MaxConcurrentRequests != 2048 || reloaded.Provider.Build.ResponseHeaderTimeout.Value() != 7*time.Minute || reloaded.Routing.MaxAttempts != 5 || !reloaded.Routing.PreferFreeBuild || !reloaded.Routing.SegmentedSelectorEnabled || reloaded.Routing.SegmentedMinCandidates != 5000 || reloaded.Routing.SegmentedWindowSize != 96 || reloaded.Audit.BufferSize != input.Audit.BufferSize || reloaded.Media.MaxTotalBytes != 2<<30 || reloaded.Media.CleanupThresholdPercent != 75 || reloaded.Batch.SyncConcurrency != 28 || reloaded.Batch.RandomDelay.Value() != 750*time.Millisecond || reloaded.Provider.Console.BaseURL != "https://console.example.com" {
+	if reloaded.Server.MaxConcurrentRequests != 2048 || reloaded.Provider.Build.ResponseHeaderTimeout.Value() != 7*time.Minute || reloaded.Routing.MaxAttempts != 5 || !reloaded.Routing.PreferFreeBuild || !reloaded.Routing.SegmentedSelectorEnabled || reloaded.Routing.SegmentedMinCandidates != 5000 || reloaded.Routing.SegmentedWindowSize != 96 || reloaded.Audit.BufferSize != input.Audit.BufferSize || reloaded.Media.MaxTotalBytes != 2<<30 || reloaded.Media.CleanupThresholdPercent != 75 || reloaded.Batch.SyncConcurrency != 28 || reloaded.Batch.RandomDelay.Value() != 750*time.Millisecond || reloaded.Provider.Console.BaseURL != "https://console.example.com" || reloaded.Provider.Web.ClearanceMode != config.ClearanceModeOnDemand {
 		t.Fatalf("configuration was not persisted")
 	}
 }
@@ -110,6 +116,43 @@ func TestUpdateRejectsBuildResponseHeaderTimeoutOutsideSafeRange(t *testing.T) {
 			}
 			if repository.found {
 				t.Fatal("invalid Build response header timeout was persisted")
+			}
+		})
+	}
+}
+
+func TestUpdateRejectsStreamIdleTimeoutBeyondChatTimeout(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*EditableConfig)
+	}{
+		{
+			name: "web",
+			mutate: func(input *EditableConfig) {
+				input.ProviderWeb.ChatTimeout = "1m"
+				input.ProviderWeb.StreamIdleTimeout = "2m"
+			},
+		},
+		{
+			name: "console",
+			mutate: func(input *EditableConfig) {
+				input.ProviderConsole.ChatTimeout = "1m"
+				input.ProviderConsole.StreamIdleTimeout = "2m"
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := testConfig(t)
+			repository := &runtimeSettingsRepositoryStub{}
+			service := NewService(cfg, time.Time{}, 0, repository, nil, nil)
+			input := service.Get().Config
+			test.mutate(&input)
+			if _, err := service.Update(context.Background(), 0, input); !errors.Is(err, ErrInvalidInput) {
+				t.Fatalf("error = %v, want ErrInvalidInput", err)
+			}
+			if repository.found {
+				t.Fatal("shadowed stream idle timeout was persisted")
 			}
 		})
 	}
@@ -287,6 +330,24 @@ func TestLoadPersistedKeepsConsoleDefaultsWhenFieldIsMissing(t *testing.T) {
 	}
 	if loaded.Provider.Console != cfg.Provider.Console {
 		t.Fatalf("console config = %#v, want %#v", loaded.Provider.Console, cfg.Provider.Console)
+	}
+}
+
+func TestLoadPersistedBackfillsProviderStreamIdleTimeoutDefaults(t *testing.T) {
+	cfg := testConfig(t)
+	value := toDomainConfig(cfg)
+	value.ProviderWeb.StreamIdleTimeout = 0
+	value.ProviderConsole.StreamIdleTimeout = 0
+	repository := &runtimeSettingsRepositoryStub{value: value, found: true}
+	loaded, _, _, err := LoadPersisted(context.Background(), cfg, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.Provider.Web.StreamIdleTimeout.Value(); got != settingsdomain.DefaultWebStreamIdleTimeout {
+		t.Fatalf("Web stream idle timeout = %s", got)
+	}
+	if got := loaded.Provider.Console.StreamIdleTimeout.Value(); got != settingsdomain.DefaultConsoleStreamIdleTimeout {
+		t.Fatalf("Console stream idle timeout = %s", got)
 	}
 }
 
@@ -642,6 +703,50 @@ func TestUpdateAuditCommitDelayRoundTrip(t *testing.T) {
 	}
 	if applied.Audit.CommitDelay.Value() != 12*time.Millisecond || snapshot.Config.Audit.CommitDelayMS != 12 {
 		t.Fatalf("applied=%s snapshot=%d", applied.Audit.CommitDelay.Value(), snapshot.Config.Audit.CommitDelayMS)
+	}
+}
+
+func TestUpdateAuditRetentionPreservesExplicitZero(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Audit.RetentionDays = 7
+	repo := &runtimeSettingsRepositoryStub{}
+	var applied config.Config
+	service := NewService(cfg, time.Time{}, 0, repo, nil, func(next config.Config) { applied = next })
+	input := service.Get().Config
+	input.Audit.RetentionDays = 0
+	input.Audit.RetentionDaysProvided = true
+
+	if _, err := service.Update(context.Background(), service.Get().Revision, input); err != nil {
+		t.Fatal(err)
+	}
+	if applied.Audit.RetentionDays != 0 {
+		t.Fatalf("applied audit policy = %#v", applied.Audit)
+	}
+	if repo.value.Audit.RetentionDays == nil || *repo.value.Audit.RetentionDays != 0 {
+		t.Fatalf("persisted audit policy = %#v", repo.value.Audit)
+	}
+	reloaded, _, _, err := LoadPersisted(context.Background(), cfg, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Audit.RetentionDays != 0 {
+		t.Fatalf("reloaded audit policy = %#v", reloaded.Audit)
+	}
+}
+
+func TestLoadPersistedKeepsAuditDefaultsForOlderPayload(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Audit.RetentionDays = 30
+	value := toDomainConfig(cfg)
+	value.Audit.RetentionDays = nil
+	repo := &runtimeSettingsRepositoryStub{value: value, found: true}
+
+	loaded, _, _, err := LoadPersisted(context.Background(), cfg, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Audit.RetentionDays != 30 {
+		t.Fatalf("legacy audit defaults = %#v", loaded.Audit)
 	}
 }
 

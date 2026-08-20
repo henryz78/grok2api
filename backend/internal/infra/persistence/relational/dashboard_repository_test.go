@@ -112,6 +112,34 @@ func TestDashboardRepositorySnapshot(t *testing.T) {
 	}
 }
 
+func TestDashboardRepositoryCounts2xxWithErrorAsFailure(t *testing.T) {
+	ctx := context.Background()
+	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "dashboard-stream-failure.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	audits := []requestAuditModel{
+		{RequestID: "healthy", ClientKeyID: 1, ModelRouteID: 1, Provider: "grok_build", Operation: "responses", UsageSource: "upstream", StatusCode: 200, CreatedAt: now.Add(-2 * time.Minute)},
+		{RequestID: "stream-interrupted", ClientKeyID: 1, ModelRouteID: 1, Provider: "grok_build", Operation: "responses", UsageSource: "upstream", StatusCode: 200, Streaming: true, ErrorCode: "upstream_stream_interrupted", CreatedAt: now.Add(-time.Minute)},
+	}
+	if err := database.db.WithContext(ctx).Create(&audits).Error; err != nil {
+		t.Fatal(err)
+	}
+	boundaries := testDashboardBoundaries(now.Add(-time.Hour), time.Hour, 2)
+	snapshot, err := NewDashboardRepository(database).Snapshot(ctx, testDashboardWindow(boundaries), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Usage.Requests != 2 || snapshot.Usage.SuccessfulRequests != 1 || snapshot.Usage.FailedRequests != 1 {
+		t.Fatalf("usage = %#v", snapshot.Usage)
+	}
+}
+
 func BenchmarkDashboardUsageAggregate(b *testing.B) {
 	ctx := context.Background()
 	database, err := OpenSQLite(ctx, filepath.Join(b.TempDir(), "dashboard-benchmark.db"))
@@ -171,6 +199,38 @@ type dashboardBenchmarkUsage struct {
 	ThroughputSamples  int64
 	ThroughputTokens   int64
 	GenerationTotalMS  int64
+}
+
+func TestDashboardRepositoryUsesFullDurationOnlyWithReasoningEvidence(t *testing.T) {
+	ctx := context.Background()
+	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "dashboard-short-tail.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	lateFirst := int64(19763)
+	normalFirst := int64(200)
+	burstFirst := int64(10000)
+	rows := []requestAuditModel{
+		{RequestID: "late-reasoning-flush", ClientKeyID: 1, ModelRouteID: 1, ModelPublicID: "grok-4.6", Provider: "grok_build", Operation: "chat", UsageSource: "upstream", StatusCode: 200, Streaming: true, OutputTokens: 1511, ReasoningTokens: 1400, FirstTokenMS: &lateFirst, DurationMS: 19827, CreatedAt: now.Add(-time.Hour)},
+		{RequestID: "normal-tail", ClientKeyID: 1, ModelRouteID: 1, ModelPublicID: "grok-4.6", Provider: "grok_build", Operation: "chat", UsageSource: "upstream", StatusCode: 200, Streaming: true, OutputTokens: 80, FirstTokenMS: &normalFirst, DurationMS: 2200, CreatedAt: now.Add(-30 * time.Minute)},
+		{RequestID: "no-reasoning-burst", ClientKeyID: 1, ModelRouteID: 1, ModelPublicID: "grok-4.6", Provider: "grok_build", Operation: "chat", UsageSource: "upstream", StatusCode: 200, Streaming: true, OutputTokens: 2000, FirstTokenMS: &burstFirst, DurationMS: 10100, CreatedAt: now.Add(-15 * time.Minute)},
+	}
+	if err := database.db.WithContext(ctx).Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	boundaries := testDashboardBoundaries(now.Add(-2*time.Hour), time.Hour, 2)
+	snapshot, err := NewDashboardRepository(database).Snapshot(ctx, testDashboardWindow(boundaries), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Usage.ThroughputTokens != 3591 || snapshot.Usage.GenerationTotalMS != 19827+2000+100 {
+		t.Fatalf("short-tail generation window = %#v", snapshot.Usage)
+	}
 }
 
 func TestDashboardRepositoryRanksTopModels(t *testing.T) {

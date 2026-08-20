@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -25,9 +26,10 @@ const (
 	StatsigModeURL                = "url"
 	ClearanceModeManual           = "manual"
 	ClearanceModeFlareSolverr     = "flaresolverr"
+	ClearanceModeOnDemand         = "on_demand"
 	DefaultStatsigSignerURL       = "https://grok.wodf.de/sign"
 	DefaultFlareSolverrURL        = "http://flaresolverr:8191"
-	RecommendedBuildClientVersion = "0.2.119"
+	RecommendedBuildClientVersion = "1.0.4"
 	RecommendedBuildUserAgent     = "grok-shell/" + RecommendedBuildClientVersion + " (linux; x86_64)"
 
 	maxServerBodyBytes     = 256 << 20
@@ -74,6 +76,7 @@ type ServerConfig struct {
 	Listen                string   `yaml:"listen"`
 	MaxBodyBytes          int64    `yaml:"maxBodyBytes"`
 	MaxConcurrentRequests int      `yaml:"maxConcurrentRequests"`
+	TrustedProxies        []string `yaml:"trustedProxies"`
 	ReadTimeout           Duration `yaml:"readTimeout"`
 	RequestTimeout        Duration `yaml:"requestTimeout"`
 	SwaggerEnabled        bool     `yaml:"swaggerEnabled"`
@@ -154,6 +157,7 @@ type BuildProviderConfig struct {
 	TokenAuth             string   `yaml:"tokenAuth"`
 	UserAgent             string   `yaml:"userAgent"`
 	ResponseHeaderTimeout Duration `yaml:"-"`
+	StreamIdleTimeout     Duration `yaml:"-"`
 }
 
 // DefaultBuildFallbackBaseURL 是主 Build API 对可回退推理操作 403 时探测的 XAI API 根地址。
@@ -170,6 +174,7 @@ type WebProviderConfig struct {
 	ClearanceRefresh    Duration `yaml:"-"`
 	QuotaTimeout        Duration `yaml:"quotaTimeout"`
 	ChatTimeout         Duration `yaml:"chatTimeout"`
+	StreamIdleTimeout   Duration `yaml:"-"`
 	ImageTimeout        Duration `yaml:"imageTimeout"`
 	VideoTimeout        Duration `yaml:"videoTimeout"`
 	MediaConcurrency    int      `yaml:"mediaConcurrency"`
@@ -179,9 +184,10 @@ type WebProviderConfig struct {
 }
 
 type ConsoleProviderConfig struct {
-	BaseURL         string   `yaml:"baseURL"`
-	LegacyUserAgent string   `yaml:"userAgent"` // Deprecated: 仅用于兼容旧配置文件，不参与请求。
-	ChatTimeout     Duration `yaml:"chatTimeout"`
+	BaseURL           string   `yaml:"baseURL"`
+	LegacyUserAgent   string   `yaml:"userAgent"` // Deprecated: 仅用于兼容旧配置文件，不参与请求。
+	ChatTimeout       Duration `yaml:"chatTimeout"`
+	StreamIdleTimeout Duration `yaml:"-"`
 }
 
 // BatchConfig 定义可热加载的账号批量任务并发上限。
@@ -207,21 +213,34 @@ type LocalMediaConfig struct {
 }
 
 type RoutingConfig struct {
-	StickyTTL       Duration `yaml:"stickyTTL"`
-	CooldownBase    Duration `yaml:"cooldownBase"`
-	CooldownMax     Duration `yaml:"cooldownMax"`
-	CapacityWait    Duration `yaml:"capacityWait"`
-	MaxAttempts     int      `yaml:"maxAttempts"`
-	PreferFreeBuild bool     `yaml:"preferFreeBuild"`
+	StickyTTL        Duration `yaml:"stickyTTL"`
+	CooldownBase     Duration `yaml:"cooldownBase"`
+	CooldownMax      Duration `yaml:"cooldownMax"`
+	CapacityWait     Duration `yaml:"capacityWait"`
+	MaxAttempts      int      `yaml:"maxAttempts"`
+	VideoMaxAttempts int      `yaml:"videoMaxAttempts"`
+	PreferFreeBuild  bool     `yaml:"preferFreeBuild"`
 	// MarkBuildChatDeniedAsReauth 为 true 时，Build chat 权限拒绝标 reauthRequired，默认 false。
-	MarkBuildChatDeniedAsReauth bool `yaml:"markBuildChatDeniedAsReauth"`
-	AccountIsolatedConnections  bool `yaml:"accountIsolatedConnections"`
+	MarkBuildChatDeniedAsReauth bool     `yaml:"markBuildChatDeniedAsReauth"`
+	AccountIsolatedConnections  bool     `yaml:"accountIsolatedConnections"`
 	SegmentedSelectorEnabled    bool     `yaml:"segmentedSelectorEnabled"`
 	SegmentedMinCandidates      int      `yaml:"segmentedSelectorMinCandidates"`
 	SegmentedWindowSize         int      `yaml:"segmentedSelectorWindowSize"`
 	ReasoningReplayEnabled      bool     `yaml:"reasoningReplayEnabled"`
 	ReasoningReplayTTL          Duration `yaml:"reasoningReplayTTL"`
 	ReasoningReplayMaxEntries   int      `yaml:"reasoningReplayMaxEntries"`
+	// AutoAssignMaxNodeShare optionally caps how many active accounts one
+	// healthy node may absorb during auto assignment. 0 keeps the historical
+	// unbounded first-pass evacuation. Values in [0.05, 1] are a fraction of
+	// the active provider pool. GROK2API_AUTO_ASSIGN_MAX_NODE_SHARE overrides
+	// this field when set to a valid value.
+	AutoAssignMaxNodeShare float64 `yaml:"autoAssignMaxNodeShare"`
+	// AutoAssignMaxMigrationShare optionally caps how many already-bound
+	// accounts may move in one maintenance cycle. 0 keeps the historical
+	// unbounded first-pass evacuation and the existing 200-move ceiling for
+	// capacity/rebalance repair. GROK2API_AUTO_ASSIGN_MAX_MIGRATION_SHARE
+	// overrides this field when set to a valid value.
+	AutoAssignMaxMigrationShare float64 `yaml:"autoAssignMaxMigrationShare"`
 }
 
 type AuditConfig struct {
@@ -229,6 +248,7 @@ type AuditConfig struct {
 	BatchSize                   int      `yaml:"batchSize"`
 	FlushInterval               Duration `yaml:"flushInterval"`
 	CommitDelay                 Duration `yaml:"commitDelay"`
+	RetentionDays               int      `yaml:"retentionDays"`
 	LedgerMode                  string   `yaml:"ledgerMode"`
 	LedgerFailureThreshold      int      `yaml:"ledgerFailureThreshold"`
 	LedgerUnhealthyGrace        Duration `yaml:"ledgerUnhealthyGrace"`
@@ -262,6 +282,22 @@ type QualityGuardConfig struct {
 	RotationToken           string   `yaml:"rotationToken"`
 	RotationTimeout         Duration `yaml:"rotationTimeout"`
 	RotatableNodeIDs        []uint64 `yaml:"rotatableNodeIDs"`
+	// RequestRetry withholds a thinking-model stream that already has enough
+	// visible output and no reasoning, then retries on another account.
+	RequestRetry QualityGuardRequestRetryConfig `yaml:"requestRetry"`
+}
+
+// QualityGuardRequestRetryConfig holds the in-process missing-thinking withhold policy.
+type QualityGuardRequestRetryConfig struct {
+	Enabled         bool     `yaml:"enabled"`
+	MaxAttempts     int      `yaml:"maxAttempts"`
+	HoldTimeout     Duration `yaml:"holdTimeout"`
+	MinOutputTokens int      `yaml:"minOutputTokens"`
+	OnExhausted     string   `yaml:"onExhausted"`
+	AccountCooldown Duration `yaml:"accountCooldown"`
+	// IdleAccountCooldown cools an account after a truly empty upstream
+	// stream. Independent of accountCooldown (missing-thinking). Zero uses 15m.
+	IdleAccountCooldown Duration `yaml:"idleAccountCooldown"`
 }
 
 type ClientKeyDefaultsConfig struct {
@@ -273,10 +309,13 @@ type ClientKeyDefaultsConfig struct {
 type AccountsConfig struct {
 	MarkBuildForbiddenReauth  bool
 	BuildForbiddenReauthCodes []string
-	AutoCleanReauthEnabled    bool
-	AutoCleanReauthInterval   Duration
-	AutoCleanReauthMinAge     Duration
-	AutoCleanIncludeDisabled  bool
+	// ExcludeBuildBotFlaggedFromScheduling removes Build accounts with bot_flag_source/bfs in {1,2}
+	// from scheduling only. Linked Web/Console accounts are unaffected.
+	ExcludeBuildBotFlaggedFromScheduling bool
+	AutoCleanReauthEnabled               bool
+	AutoCleanReauthInterval              Duration
+	AutoCleanReauthMinAge                Duration
+	AutoCleanIncludeDisabled             bool
 }
 
 type Secrets struct {
@@ -427,6 +466,25 @@ func (c Config) Validate() error {
 	if c.Server.MaxConcurrentRequests < 1 || c.Server.MaxConcurrentRequests > 100000 {
 		return errors.New("server.maxConcurrentRequests 必须在 1 到 100000 之间")
 	}
+	for _, value := range c.Server.TrustedProxies {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			return errors.New("server.trustedProxies 不能包含空值")
+		}
+		if trimmed != value {
+			return fmt.Errorf("server.trustedProxies %q 不能包含首尾空白", value)
+		}
+		if net.ParseIP(trimmed) != nil {
+			continue
+		}
+		_, network, err := net.ParseCIDR(trimmed)
+		if err != nil {
+			return fmt.Errorf("server.trustedProxies %q 必须是 IP 或 CIDR", value)
+		}
+		if ones, _ := network.Mask.Size(); ones == 0 {
+			return fmt.Errorf("server.trustedProxies %q 不能信任整个互联网", value)
+		}
+	}
 	for _, item := range []struct {
 		name  string
 		value string
@@ -540,6 +598,9 @@ func (c Config) Validate() error {
 	if timeout := c.Provider.Build.ResponseHeaderTimeout.Value(); timeout < settingsdomain.MinBuildResponseHeaderTimeout || timeout > settingsdomain.MaxBuildResponseHeaderTimeout {
 		return errors.New("Grok Build 响应头超时必须在 30 秒到 30 分钟之间")
 	}
+	if idle := c.Provider.Build.StreamIdleTimeout.Value(); idle < settingsdomain.MinBuildStreamIdleTimeout || idle > settingsdomain.MaxBuildStreamIdleTimeout {
+		return errors.New("Grok Build 流式空闲超时必须在 30 秒到 10 分钟之间")
+	}
 	webURL, err := url.ParseRequestURI(strings.TrimSpace(c.Provider.Web.BaseURL))
 	if err != nil || webURL.Scheme != "https" || webURL.Host == "" || webURL.User != nil {
 		return errors.New("provider.web.baseURL 必须是无凭据的 HTTPS URL")
@@ -558,12 +619,12 @@ func (c Config) Validate() error {
 	}
 	switch c.Provider.Web.ClearanceMode {
 	case ClearanceModeManual:
-	case ClearanceModeFlareSolverr:
+	case ClearanceModeFlareSolverr, ClearanceModeOnDemand:
 		if err := validateFlareSolverrURL(c.Provider.Web.FlareSolverrURL); err != nil {
 			return fmt.Errorf("provider.web FlareSolverr URL 无效: %w", err)
 		}
 	default:
-		return errors.New("provider.web Clearance 模式必须是 manual 或 flaresolverr")
+		return errors.New("provider.web Clearance 模式必须是 manual、flaresolverr 或 on_demand")
 	}
 	if c.Provider.Web.ClearanceTimeout.Value() < 10*time.Second || c.Provider.Web.ClearanceTimeout.Value() > 5*time.Minute {
 		return errors.New("provider.web Clearance 超时必须在 10 秒到 5 分钟之间")
@@ -577,6 +638,9 @@ func (c Config) Validate() error {
 		c.Provider.Web.VideoTimeout.Value() < time.Minute || c.Provider.Web.VideoTimeout.Value() > 2*time.Hour {
 		return errors.New("provider.web 上游超时配置无效")
 	}
+	if idle := c.Provider.Web.StreamIdleTimeout.Value(); idle < settingsdomain.MinProviderStreamIdleTimeout || idle > settingsdomain.MaxProviderStreamIdleTimeout {
+		return errors.New("Grok Web 流式空闲超时必须在 30 秒到 10 分钟之间")
+	}
 	if c.Provider.Web.MediaConcurrency < 1 || c.Provider.Web.MediaConcurrency > 64 {
 		return errors.New("provider.web 媒体并发必须在 1 到 64 之间")
 	}
@@ -586,6 +650,9 @@ func (c Config) Validate() error {
 	}
 	if c.Provider.Console.ChatTimeout.Value() < 5*time.Second || c.Provider.Console.ChatTimeout.Value() > 30*time.Minute {
 		return errors.New("provider.console.chatTimeout 必须在 5 秒到 30 分钟之间")
+	}
+	if idle := c.Provider.Console.StreamIdleTimeout.Value(); idle < settingsdomain.MinProviderStreamIdleTimeout || idle > settingsdomain.MaxProviderStreamIdleTimeout {
+		return errors.New("Grok Console 流式空闲超时必须在 30 秒到 10 分钟之间")
 	}
 	if c.Batch.ImportConcurrency < 1 || c.Batch.ImportConcurrency > 50 ||
 		c.Batch.ConversionConcurrency < 1 || c.Batch.ConversionConcurrency > 50 ||
@@ -599,7 +666,7 @@ func (c Config) Validate() error {
 	if c.Provider.Web.RecoveryBackoffBase.Value() < 5*time.Second || c.Provider.Web.RecoveryBackoffMax.Value() < c.Provider.Web.RecoveryBackoffBase.Value() || c.Provider.Web.RecoveryBackoffMax.Value() > 6*time.Hour {
 		return errors.New("provider.web 恢复退避配置无效")
 	}
-	if c.Routing.StickyTTL.Value() <= 0 || c.Routing.StickyTTL.Value() > maxRoutingTTL || c.Routing.CooldownBase.Value() <= 0 || c.Routing.CooldownMax.Value() < c.Routing.CooldownBase.Value() || c.Routing.CooldownMax.Value() > maxRoutingCooldown || c.Routing.CapacityWait.Value() <= 0 || c.Routing.CapacityWait.Value() > maxRoutingCapacityWait || c.Routing.MaxAttempts < unlimitedRoutingAttempts || c.Routing.MaxAttempts == 0 || c.Routing.MaxAttempts > maxRoutingAttempts {
+	if c.Routing.StickyTTL.Value() <= 0 || c.Routing.StickyTTL.Value() > maxRoutingTTL || c.Routing.CooldownBase.Value() <= 0 || c.Routing.CooldownMax.Value() < c.Routing.CooldownBase.Value() || c.Routing.CooldownMax.Value() > maxRoutingCooldown || c.Routing.CapacityWait.Value() <= 0 || c.Routing.CapacityWait.Value() > maxRoutingCapacityWait || (c.Routing.MaxAttempts < unlimitedRoutingAttempts || c.Routing.MaxAttempts == 0 || c.Routing.MaxAttempts > maxRoutingAttempts) || (c.Routing.VideoMaxAttempts < unlimitedRoutingAttempts || c.Routing.VideoMaxAttempts > maxRoutingAttempts) {
 		return errors.New("routing 配置无效")
 	}
 	if c.Routing.SegmentedMinCandidates < 100 || c.Routing.SegmentedMinCandidates > 1000000 ||
@@ -613,11 +680,17 @@ func (c Config) Validate() error {
 	if c.Routing.ReasoningReplayMaxEntries < 100 || c.Routing.ReasoningReplayMaxEntries > 1000000 {
 		return errors.New("routing.reasoningReplayMaxEntries 必须在 100 到 1000000 之间")
 	}
+	if !validAutoAssignShare(c.Routing.AutoAssignMaxNodeShare) || !validAutoAssignShare(c.Routing.AutoAssignMaxMigrationShare) {
+		return errors.New("routing.autoAssignMaxNodeShare 与 autoAssignMaxMigrationShare 必须为 0 或 0.05 到 1 之间")
+	}
 	if c.Audit.BufferSize < 1 || c.Audit.BufferSize > maxAuditBufferSize || c.Audit.BatchSize < 1 || c.Audit.BatchSize > maxAuditBatchSize || c.Audit.BatchSize > c.Audit.BufferSize || c.Audit.FlushInterval.Value() < minAuditFlushInterval || c.Audit.FlushInterval.Value() > maxAuditFlushInterval {
 		return errors.New("audit 队列和批量写入配置无效")
 	}
 	if c.Audit.CommitDelay.Value() < minAuditCommitDelay || c.Audit.CommitDelay.Value() > maxAuditCommitDelay {
 		return errors.New("audit.commitDelay 必须在 1ms 到 50ms 之间")
+	}
+	if c.Audit.RetentionDays < 0 || c.Audit.RetentionDays > 365 {
+		return errors.New("audit.retentionDays 必须在 0 到 365 之间")
 	}
 	if c.Audit.LedgerMode != "observe" && c.Audit.LedgerMode != "enforce" {
 		return errors.New("audit.ledgerMode 必须是 observe 或 enforce")
@@ -658,6 +731,9 @@ func (c Config) Validate() error {
 }
 
 func validateQualityGuardConfig(value QualityGuardConfig) error {
+	if err := validateQualityGuardRequestRetry(value.RequestRetry); err != nil {
+		return err
+	}
 	if !value.Enabled {
 		return nil
 	}
@@ -707,6 +783,37 @@ func validateQualityGuardConfig(value QualityGuardConfig) error {
 		}
 	}
 	return nil
+}
+
+func validateQualityGuardRequestRetry(value QualityGuardRequestRetryConfig) error {
+	if !value.Enabled {
+		return nil
+	}
+	if value.MaxAttempts != 0 && (value.MaxAttempts < 1 || value.MaxAttempts > 6) {
+		return errors.New("qualityGuard.requestRetry.maxAttempts 必须在 1 到 6 之间")
+	}
+	if d := value.HoldTimeout.Value(); d != 0 && (d < 200*time.Millisecond || d > 30*time.Second) {
+		return errors.New("qualityGuard.requestRetry.holdTimeout 必须在 200ms 到 30s 之间")
+	}
+	if value.MinOutputTokens != 0 && (value.MinOutputTokens < 8 || value.MinOutputTokens > 256) {
+		return errors.New("qualityGuard.requestRetry.minOutputTokens 必须在 8 到 256 之间")
+	}
+	switch strings.TrimSpace(value.OnExhausted) {
+	case "", "fail_open", "fail_closed":
+	default:
+		return errors.New("qualityGuard.requestRetry.onExhausted 必须是 fail_open 或 fail_closed")
+	}
+	if d := value.AccountCooldown.Value(); d != 0 && (d < time.Minute || d > 168*time.Hour) {
+		return errors.New("qualityGuard.requestRetry.accountCooldown 必须在 1m 到 168h 之间")
+	}
+	if d := value.IdleAccountCooldown.Value(); d != 0 && (d < time.Minute || d > 168*time.Hour) {
+		return errors.New("qualityGuard.requestRetry.idleAccountCooldown 必须在 1m 到 168h 之间")
+	}
+	return nil
+}
+
+func validAutoAssignShare(value float64) bool {
+	return value == 0 || (value >= 0.05 && value <= 1)
 }
 
 func validUniquePositiveIDs(values []uint64) bool {
@@ -780,18 +887,20 @@ func defaultConfig() Config {
 				BaseURL: "https://cli-chat-proxy.grok.com/v1", FallbackBaseURL: DefaultBuildFallbackBaseURL,
 				ClientVersion: RecommendedBuildClientVersion, ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli",
 				UserAgent: RecommendedBuildUserAgent, ResponseHeaderTimeout: Duration(settingsdomain.DefaultBuildResponseHeaderTimeout),
+				StreamIdleTimeout: Duration(settingsdomain.DefaultBuildStreamIdleTimeout),
 			},
 			Web: WebProviderConfig{
 				BaseURL: "https://grok.com", StatsigMode: StatsigModeURL, StatsigSignerURL: DefaultStatsigSignerURL,
 				ClearanceMode: ClearanceModeManual, FlareSolverrURL: DefaultFlareSolverrURL,
 				ClearanceTimeout: Duration(time.Minute), ClearanceRefresh: Duration(10 * time.Minute),
 				QuotaTimeout: Duration(25 * time.Second),
-				ChatTimeout:  Duration(2 * time.Minute), ImageTimeout: Duration(3 * time.Minute),
+				ChatTimeout:  Duration(2 * time.Minute), StreamIdleTimeout: Duration(settingsdomain.DefaultWebStreamIdleTimeout),
+				ImageTimeout:     Duration(3 * time.Minute),
 				VideoTimeout:     Duration(15 * time.Minute),
 				MediaConcurrency: 4, RecoveryBackoffBase: Duration(30 * time.Second),
 				RecoveryBackoffMax: Duration(30 * time.Minute),
 			},
-			Console: ConsoleProviderConfig{BaseURL: "https://console.x.ai", ChatTimeout: Duration(5 * time.Minute)},
+			Console: ConsoleProviderConfig{BaseURL: "https://console.x.ai", ChatTimeout: Duration(5 * time.Minute), StreamIdleTimeout: Duration(settingsdomain.DefaultConsoleStreamIdleTimeout)},
 		},
 		Batch: BatchConfig{
 			ImportConcurrency: 25, ConversionConcurrency: 25, SyncConcurrency: 25,
@@ -808,10 +917,11 @@ func defaultConfig() Config {
 			CooldownMax:                 Duration(30 * time.Minute),
 			CapacityWait:                Duration(500 * time.Millisecond),
 			MaxAttempts:                 999,
+			VideoMaxAttempts:            999,
 			MarkBuildChatDeniedAsReauth: false,
 			PreferFreeBuild:             false,
 			AccountIsolatedConnections:  false,
-			SegmentedSelectorEnabled:    false,
+			SegmentedSelectorEnabled:    true,
 			SegmentedMinCandidates:      3000,
 			SegmentedWindowSize:         64,
 			ReasoningReplayEnabled:      true,
@@ -820,25 +930,31 @@ func defaultConfig() Config {
 		},
 		Audit: AuditConfig{
 			BufferSize: 16384, BatchSize: 256, FlushInterval: Duration(250 * time.Millisecond), CommitDelay: Duration(5 * time.Millisecond),
-			LedgerMode: "enforce", LedgerFailureThreshold: 1,
+			RetentionDays: 7,
+			LedgerMode:    "enforce", LedgerFailureThreshold: 1,
 			LedgerUnhealthyGrace: Duration(10 * time.Second), LedgerQueueHighWatermarkPct: 90,
 		},
 		QualityGuard: QualityGuardConfig{
-			Model: "grok-4.5", Mode: "hybrid",
+			Model: "grok-4.6", Mode: "hybrid",
 			ActiveInterval: Duration(30 * time.Minute), PassivePollInterval: Duration(5 * time.Second),
 			SoftTPS: 500, HardTPS: 1000, ConsecutiveSoft: 2, ConsecutiveErrors: 2,
 			QuarantineDuration: Duration(5 * time.Minute), NoAccountBackoff: Duration(5 * time.Minute),
 			MinimumHealthyNodes: 3, MaxOutputTokens: 384,
 			MinimumGenerationWindow: Duration(time.Second), RotationTimeout: Duration(45 * time.Second),
+			RequestRetry: QualityGuardRequestRetryConfig{
+				MaxAttempts: 6, HoldTimeout: Duration(30 * time.Second), MinOutputTokens: 8, OnExhausted: "fail_closed",
+				AccountCooldown: Duration(12 * time.Hour), IdleAccountCooldown: Duration(15 * time.Minute),
+			},
 		},
 		ClientKeyDefaults: ClientKeyDefaultsConfig{RPMLimit: clientkeydomain.DefaultRPMLimit, MaxConcurrent: clientkeydomain.DefaultMaxConcurrent},
 		Accounts: AccountsConfig{
-			MarkBuildForbiddenReauth:  false,
-			BuildForbiddenReauthCodes: []string{"permission-denied"},
-			AutoCleanReauthEnabled:    false,
-			AutoCleanReauthInterval:   Duration(10 * time.Minute),
-			AutoCleanReauthMinAge:     Duration(time.Hour),
-			AutoCleanIncludeDisabled:  false,
+			MarkBuildForbiddenReauth:             false,
+			BuildForbiddenReauthCodes:            []string{"permission-denied"},
+			ExcludeBuildBotFlaggedFromScheduling: false,
+			AutoCleanReauthEnabled:               false,
+			AutoCleanReauthInterval:              Duration(10 * time.Minute),
+			AutoCleanReauthMinAge:                Duration(time.Hour),
+			AutoCleanIncludeDisabled:             false,
 		},
 	}
 }
