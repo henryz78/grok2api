@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -44,16 +45,17 @@ const (
 	accountPaidBillingSignals   = `(` + accountPaidPlanSignal + ` OR billing.monthly_limit > 0 OR billing.on_demand_cap > 0 OR billing.on_demand_used > 0 OR billing.prepaid_balance > 0)`
 	accountPaidBillingPredicate = `EXISTS (SELECT 1 FROM account_billing_snapshots billing WHERE billing.account_id = provider_accounts.id AND ` + accountPaidBillingSignals + `)`
 	// 仅 grok_build 的管理员确认 Super entitlement；与 domain.IsBuildSuper 对齐。
-	accountBuildSuperEntitledPredicate = `(provider_accounts.provider = 'grok_build' AND provider_accounts.build_super_entitled = TRUE)`
-	accountBuildSuperPredicate         = `(` + accountPaidBillingPredicate + ` OR ` + accountBuildSuperEntitledPredicate + `)`
-	accountInferredFreeBillingSignal   = `(TRIM(billing.plan_code) = '' AND TRIM(billing.plan_name) = '' AND billing.synced_at IS NOT NULL AND billing.monthly_limit = 0 AND billing.used = 0 AND billing.on_demand_cap = 0 AND billing.on_demand_used = 0 AND billing.prepaid_balance = 0 AND billing.credit_usage_percent = 0)`
-	accountFreeBillingSignal           = `(` + accountFreePlanSignal + ` OR ` + accountInferredFreeBillingSignal + `)`
-	accountFreeSignalPredicate         = `(provider_accounts.provider = 'grok_build' AND (LOWER(TRIM(provider_accounts.observed_model)) LIKE '%-build-free' OR EXISTS (SELECT 1 FROM account_billing_snapshots billing WHERE billing.account_id = provider_accounts.id AND ` + accountFreeBillingSignal + `)))`
-	accountRecoveryPredicate           = `EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = provider_accounts.id AND recovery.status IN ('exhausted', 'probing'))`
-	providerQuotaExhaustedPredicate    = `((provider_accounts.provider = 'grok_web' AND ((EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.mode = 'weekly') AND NOT EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.mode = 'weekly' AND quota.remaining > 0)) OR (NOT EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.mode = 'weekly') AND EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id) AND NOT EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.remaining > 0)))) OR (provider_accounts.provider = 'grok_console' AND EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.mode = 'console') AND NOT EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.mode = 'console' AND quota.remaining > 0)))`
-	accountTypeSortExpression          = `CASE WHEN provider_accounts.provider = 'grok_web' THEN COALESCE((SELECT profile.tier FROM web_account_profiles profile WHERE profile.account_id = provider_accounts.id), 'auto') WHEN ` + accountBuildSuperPredicate + ` THEN 'paid' WHEN ` + accountFreeSignalPredicate + ` THEN 'free' ELSE 'unknown' END`
-	accountStatusSortExpression        = `CASE WHEN provider_accounts.enabled = FALSE THEN 4 WHEN provider_accounts.auth_status = 'reauthRequired' THEN 5 WHEN EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = provider_accounts.id AND recovery.status = 'probing') THEN 3 WHEN EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = provider_accounts.id AND recovery.status = 'exhausted') OR ` + providerQuotaExhaustedPredicate + ` THEN 2 WHEN provider_accounts.cooldown_until > CURRENT_TIMESTAMP THEN 1 ELSE 0 END`
-	missingConsoleAccountPredicate     = `NOT EXISTS (SELECT 1 FROM provider_accounts AS console_account WHERE console_account.provider = ? AND console_account.source_key = ('console-' || provider_accounts.source_key))`
+	accountBuildSuperEntitledPredicate        = `(provider_accounts.provider = 'grok_build' AND provider_accounts.build_super_entitled = TRUE)`
+	accountBuildSuperPredicate                = `(` + accountPaidBillingPredicate + ` OR ` + accountBuildSuperEntitledPredicate + `)`
+	accountInferredFreeBillingSignal          = `(TRIM(billing.plan_code) = '' AND TRIM(billing.plan_name) = '' AND billing.synced_at IS NOT NULL AND billing.monthly_limit = 0 AND billing.used = 0 AND billing.on_demand_cap = 0 AND billing.on_demand_used = 0 AND billing.prepaid_balance = 0 AND billing.credit_usage_percent = 0)`
+	accountFreeBillingSignal                  = `(` + accountFreePlanSignal + ` OR ` + accountInferredFreeBillingSignal + `)`
+	accountFreeSignalPredicate                = `(provider_accounts.provider = 'grok_build' AND (LOWER(TRIM(provider_accounts.observed_model)) LIKE '%-build-free' OR EXISTS (SELECT 1 FROM account_billing_snapshots billing WHERE billing.account_id = provider_accounts.id AND ` + accountFreeBillingSignal + `)))`
+	accountRecoveryPredicate                  = `EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = provider_accounts.id AND recovery.status IN ('exhausted', 'probing'))`
+	providerQuotaExhaustedPredicate           = `((provider_accounts.provider = 'grok_web' AND ((EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.mode = 'weekly') AND NOT EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.mode = 'weekly' AND quota.remaining > 0)) OR (NOT EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.mode = 'weekly') AND EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id) AND NOT EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.remaining > 0)))) OR (provider_accounts.provider = 'grok_console' AND EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.mode = 'console') AND NOT EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.mode = 'console' AND quota.remaining > 0)))`
+	accountTypeSortExpression                 = `CASE WHEN provider_accounts.provider = 'grok_web' THEN COALESCE((SELECT profile.tier FROM web_account_profiles profile WHERE profile.account_id = provider_accounts.id), 'auto') WHEN ` + accountBuildSuperPredicate + ` THEN 'paid' WHEN ` + accountFreeSignalPredicate + ` THEN 'free' ELSE 'unknown' END`
+	accountStatusSortExpression               = `CASE WHEN provider_accounts.enabled = FALSE THEN 4 WHEN provider_accounts.auth_status = 'reauthRequired' THEN 5 WHEN EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = provider_accounts.id AND recovery.status = 'probing') THEN 3 WHEN EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = provider_accounts.id AND recovery.status = 'exhausted') OR ` + providerQuotaExhaustedPredicate + ` THEN 2 WHEN provider_accounts.cooldown_until > CURRENT_TIMESTAMP THEN 1 ELSE 0 END`
+	accountUnclassifiedRefreshReauthPredicate = `NOT EXISTS (SELECT 1 FROM account_credentials credential WHERE credential.account_id = provider_accounts.id AND credential.refresh_permanent = FALSE AND credential.refresh_unclassified_auth_failures > 0)`
+	missingConsoleAccountPredicate            = `NOT EXISTS (SELECT 1 FROM provider_accounts AS console_account WHERE console_account.provider = ? AND console_account.source_key = ('console-' || provider_accounts.source_key))`
 )
 
 func (r *AccountRepository) List(ctx context.Context, input repository.AccountListQuery) ([]account.Credential, int64, error) {
@@ -63,8 +65,14 @@ func (r *AccountRepository) List(ctx context.Context, input repository.AccountLi
 		query = query.Where("provider = ?", input.Filter.Provider)
 	}
 	if search := strings.TrimSpace(input.Page.Search); search != "" {
-		pattern := "%" + strings.ToLower(search) + "%"
-		query = query.Where("LOWER(name) LIKE ? OR LOWER(email) LIKE ? OR LOWER(user_id) LIKE ? OR LOWER(team_id) LIKE ?", pattern, pattern, pattern, pattern)
+		if id, err := strconv.ParseUint(strings.TrimPrefix(search, "#"), 10, 64); strings.HasPrefix(search, "#") && err == nil && id > 0 {
+			// #ID 是管理端名单使用的内部精确查询形式，走主键索引且不改变
+			// 原有纯数字名称的模糊搜索语义。
+			query = query.Where("provider_accounts.id = ?", id)
+		} else {
+			pattern := "%" + strings.ToLower(search) + "%"
+			query = query.Where("LOWER(name) LIKE ? OR LOWER(email) LIKE ? OR LOWER(user_id) LIKE ? OR LOWER(team_id) LIKE ?", pattern, pattern, pattern, pattern)
+		}
 	}
 	switch input.Filter.QuotaType {
 	case "free":
@@ -96,6 +104,12 @@ func (r *AccountRepository) List(ctx context.Context, input repository.AccountLi
 		} else {
 			query = query.Where("NOT EXISTS (SELECT 1 FROM account_credentials credential WHERE credential.account_id = provider_accounts.id AND credential.encrypted_refresh <> '')")
 		}
+	}
+	switch input.Filter.Risk {
+	case "flagged":
+		query = query.Where("EXISTS (SELECT 1 FROM account_credentials credential WHERE credential.account_id = provider_accounts.id AND credential.build_bot_flag_source IN (1,2))")
+	case "normal":
+		query = query.Where("NOT EXISTS (SELECT 1 FROM account_credentials credential WHERE credential.account_id = provider_accounts.id AND credential.build_bot_flag_source IN (1,2))")
 	}
 	query = applyWebAgreementFilter(query, input.Filter.Agreement)
 	query = applyAssociationFilter(query, input.Filter.Provider, input.Filter.Association)
@@ -178,6 +192,120 @@ func (r *AccountRepository) CountProviderAccountsByIDs(ctx context.Context, prov
 	return count, err
 }
 
+// CountAvailableAmong counts IDs that currently match Summarize's available predicate.
+func (r *AccountRepository) CountAvailableAmong(ctx context.Context, providerValue account.Provider, ids []uint64, now time.Time) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	const batchSize = 500
+	var total int64
+	for start := 0; start < len(ids); start += batchSize {
+		end := min(start+batchSize, len(ids))
+		var count int64
+		query := r.db.db.WithContext(ctx).Model(&accountModel{}).
+			Where("provider = ? AND id IN ?", providerValue, ids[start:end])
+		query = applyAccountStatusFilter(query, "active", now)
+		if err := query.Count(&count).Error; err != nil {
+			return 0, err
+		}
+		total += count
+	}
+	return total, nil
+}
+
+// CountBuildBotFlagged counts persisted Build risk metadata without loading an
+// account-ID slice or credential material.
+func (r *AccountRepository) CountBuildBotFlagged(ctx context.Context) (int64, error) {
+	var count int64
+	err := r.db.db.WithContext(ctx).Model(&accountModel{}).
+		Joins("JOIN account_credentials AS credential ON credential.account_id = provider_accounts.id").
+		Where("provider_accounts.provider = ? AND credential.build_bot_flag_source IN (1,2)", account.ProviderBuild).
+		Count(&count).Error
+	return count, err
+}
+
+// CountAvailableBuildBotFlagged uses the same availability predicate as
+// Summarize without expanding a potentially unbounded ID list.
+func (r *AccountRepository) CountAvailableBuildBotFlagged(ctx context.Context, now time.Time) (int64, error) {
+	var count int64
+	query := r.db.db.WithContext(ctx).Model(&accountModel{}).
+		Joins("JOIN account_credentials AS credential ON credential.account_id = provider_accounts.id").
+		Where("provider_accounts.provider = ? AND credential.build_bot_flag_source IN (1,2)", account.ProviderBuild)
+	query = applyAccountStatusFilter(query, "active", now)
+	err := query.Count(&count).Error
+	return count, err
+}
+
+// ListBuildBotFlaggedAccountIDs reads persisted non-sensitive metadata only; it
+// never loads or decrypts access tokens on the scheduling path.
+func (r *AccountRepository) ListBuildBotFlaggedAccountIDs(ctx context.Context) ([]uint64, error) {
+	var ids []uint64
+	err := r.db.db.WithContext(ctx).
+		Table("provider_accounts AS account").
+		Select("account.id").
+		Joins("JOIN account_credentials AS credential ON credential.account_id = account.id").
+		Where("account.provider = ? AND credential.build_bot_flag_source IN (1,2)", account.ProviderBuild).
+		Order("account.id ASC").
+		Scan(&ids).Error
+	return ids, err
+}
+
+// ListBuildBotFlagCredentialBatch returns the minimum projection required for
+// startup backfill of the persisted risk source.
+func (r *AccountRepository) ListBuildBotFlagCredentialBatch(ctx context.Context, afterID uint64, limit int) ([]repository.BuildBotFlagCredential, error) {
+	if limit < 1 {
+		return []repository.BuildBotFlagCredential{}, nil
+	}
+	var rows []struct {
+		AccountID            uint64
+		EncryptedAccessToken string
+		StoredSource         int
+	}
+	err := r.db.db.WithContext(ctx).
+		Table("provider_accounts AS account").
+		Select("account.id AS account_id, credential.encrypted_primary AS encrypted_access_token, credential.build_bot_flag_source AS stored_source").
+		Joins("JOIN account_credentials AS credential ON credential.account_id = account.id").
+		Where("account.provider = ? AND account.id > ?", account.ProviderBuild, afterID).
+		Order("account.id ASC").Limit(limit).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	result := make([]repository.BuildBotFlagCredential, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, repository.BuildBotFlagCredential{
+			AccountID: row.AccountID, EncryptedAccessToken: row.EncryptedAccessToken, StoredSource: row.StoredSource,
+		})
+	}
+	return result, nil
+}
+
+// UpdateBuildBotFlagSources persists a bounded backfill batch transactionally.
+func (r *AccountRepository) UpdateBuildBotFlagSources(ctx context.Context, values []repository.BuildBotFlagSourceUpdate) error {
+	if len(values) == 0 {
+		return nil
+	}
+	changed := false
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for _, value := range values {
+			source := normalizeBuildBotFlagSource(account.ProviderBuild, value.Source)
+			result := tx.Model(&accountCredentialModel{}).
+				Where("account_id = ? AND encrypted_primary = ?", value.AccountID, value.ExpectedEncryptedAccessToken).
+				Update("build_bot_flag_source", source)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected > 0 {
+				changed = true
+			}
+		}
+		return nil
+	})
+	if err == nil && changed {
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountCredentialChanged, Provider: account.ProviderBuild})
+	}
+	return err
+}
+
 func (r *AccountRepository) Summarize(ctx context.Context, now time.Time) ([]repository.AccountSummary, error) {
 	var rows []repository.AccountSummary
 	selectFields := `
@@ -234,7 +362,11 @@ func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider 
 	if err != nil {
 		return nil, err
 	}
-	quotaWindows, err := r.getRoutingQuotaWindows(ctx, provider, quotaMode)
+	quotaWindows, err := r.getRoutingQuotaWindows(ctx, provider, quotaMode, values)
+	if err != nil {
+		return nil, err
+	}
+	egressLeaseBlocks, err := r.getRoutingEgressLeaseBlocks(ctx, provider, values, time.Now().UTC())
 	if err != nil {
 		return nil, err
 	}
@@ -296,15 +428,16 @@ func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider 
 		}
 	}
 	result := make([]account.RoutingCandidate, 0, len(values))
-	staticConsoleModel := provider == account.ProviderConsole && strings.TrimSpace(quotaMode) != ""
+	staticProviderModel := (provider == account.ProviderConsole && strings.TrimSpace(quotaMode) != "") ||
+		(provider == account.ProviderWeb && account.IsWebImagineQuotaMode(quotaMode))
 	for _, value := range values {
 		capabilityKnown, supportsModel := known[value.ID], supported[value.ID]
-		if staticConsoleModel {
-			// Console exposes a provider-wide static catalog. Historical account
-			// snapshots may predate newly shipped catalog entries, but must not
-			// make those built-in routes unroutable until every account is synced
-			// again. A non-empty quota mode proves the adapter recognizes the
-			// upstream model; unknown/manual models keep snapshot-based gating.
+		if staticProviderModel {
+			// Console and Web Imagine expose provider-wide static catalogs.
+			// Historical account snapshots may predate newly shipped catalog
+			// entries, but must not make those routes unroutable. A recognized
+			// quota mode proves the adapter knows the model; unknown/manual models
+			// keep snapshot-based gating.
 			capabilityKnown, supportsModel = true, true
 		} else if len(bound) > 0 {
 			capabilityKnown, supportsModel = true, true
@@ -330,6 +463,9 @@ func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider 
 		if block, ok := modelQuotaBlocks[value.ID]; ok {
 			candidate.ModelQuotaBlock = &block
 		}
+		if block, ok := egressLeaseBlocks[value.ID]; ok {
+			candidate.EgressLeaseBlock = &block
+		}
 		result = append(result, candidate)
 	}
 	return result, nil
@@ -348,7 +484,11 @@ func (r *AccountRepository) ListRoutingAccountBases(ctx context.Context, provide
 	if err != nil {
 		return nil, err
 	}
-	quotaWindows, err := r.getRoutingQuotaWindows(ctx, provider, quotaMode)
+	quotaWindows, err := r.getRoutingQuotaWindows(ctx, provider, quotaMode, values)
+	if err != nil {
+		return nil, err
+	}
+	egressLeaseBlocks, err := r.getRoutingEgressLeaseBlocks(ctx, provider, values, time.Now().UTC())
 	if err != nil {
 		return nil, err
 	}
@@ -364,7 +504,30 @@ func (r *AccountRepository) ListRoutingAccountBases(ctx context.Context, provide
 		if window, ok := quotaWindows[value.ID]; ok {
 			base.QuotaWindow = &window
 		}
+		if block, ok := egressLeaseBlocks[value.ID]; ok {
+			base.EgressLeaseBlock = &block
+		}
 		result = append(result, base)
+	}
+	return result, nil
+}
+
+func (r *AccountRepository) getRoutingEgressLeaseBlocks(ctx context.Context, provider account.Provider, values []account.Credential, now time.Time) (map[uint64]account.EgressLeaseBlock, error) {
+	result := make(map[uint64]account.EgressLeaseBlock)
+	if len(values) == 0 {
+		return result, nil
+	}
+	var rows []accountEgressLeaseBlockModel
+	if err := r.db.db.WithContext(ctx).
+		Table("account_egress_lease_blocks AS block").
+		Select("block.*").
+		Joins("JOIN provider_accounts AS account ON account.id = block.account_id").
+		Where("account.provider = ? AND account.enabled = ? AND account.auth_status = ? AND account.egress_node_id = block.node_id AND block.cooldown_until > ?", provider, true, account.AuthStatusActive, now.UTC()).
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		result[row.AccountID] = egressLeaseBlockFromModel(row)
 	}
 	return result, nil
 }
@@ -458,7 +621,7 @@ func qualifiedColumnList(alias string, columns []string) string {
 // access token, refresh token, and Cloudflare cookie.
 var routingCredentialMetadataColumns = []string{
 	"account_id", "auth_type", "client_id", "expires_at", "refresh_due_at", "last_refresh_at",
-	"refresh_failures", "last_refresh_error", "refresh_permanent", "updated_at",
+	"refresh_failures", "last_refresh_error", "refresh_permanent", "build_bot_flag_source", "updated_at",
 }
 
 var routingBillingColumns = []string{
@@ -509,14 +672,23 @@ var routingQuotaWindowColumns = []string{
 	"account_id", "mode", "remaining", "total", "usage_percent", "window_seconds", "reset_at", "synced_at", "source", "updated_at",
 }
 
-func (r *AccountRepository) getRoutingQuotaWindows(ctx context.Context, provider account.Provider, quotaMode string) (map[uint64]account.QuotaWindow, error) {
+func (r *AccountRepository) getRoutingQuotaWindows(ctx context.Context, provider account.Provider, quotaMode string, credentials []account.Credential) (map[uint64]account.QuotaWindow, error) {
 	result := make(map[uint64]account.QuotaWindow)
 	if provider != account.ProviderWeb && quotaMode == "" {
 		return result, nil
 	}
 	modes := make([]string, 0, 2)
-	if provider == account.ProviderWeb {
+	// Paid Web chat routes are governed by the shared weekly pool. Imagine
+	// products have independent authoritative windows and must not be hidden by
+	// a weekly row merely because the same account also has paid chat access.
+	if provider == account.ProviderWeb && !account.IsWebImagineQuotaMode(quotaMode) {
 		modes = append(modes, "weekly")
+	}
+	if provider == account.ProviderWeb && quotaMode == account.QuotaModeWebImageEdit {
+		// Basic Web accounts use image_pro for editing, while Super/Heavy
+		// accounts have the dedicated image_edit product. Load both once and
+		// select the authoritative window per account below.
+		modes = append(modes, account.QuotaModeWebImagePro)
 	}
 	if quotaMode != "" {
 		modes = append(modes, quotaMode)
@@ -531,12 +703,32 @@ func (r *AccountRepository) getRoutingQuotaWindows(ctx context.Context, provider
 		Find(&rows).Error; err != nil {
 		return nil, err
 	}
+	webTiers := make(map[uint64]account.WebTier, len(credentials))
+	for _, credential := range credentials {
+		webTiers[credential.ID] = credential.WebTier
+	}
 	for _, row := range rows {
+		if provider == account.ProviderWeb && quotaMode == account.QuotaModeWebImageEdit {
+			if row.Mode != webImageEditRoutingQuotaMode(webTiers[row.AccountID]) {
+				continue
+			}
+		}
 		if _, exists := result[row.AccountID]; !exists {
 			result[row.AccountID] = toRoutingQuotaWindowDomain(row)
 		}
 	}
 	return result, nil
+}
+
+func webImageEditRoutingQuotaMode(tier account.WebTier) string {
+	switch tier {
+	case account.WebTierSuper, account.WebTierHeavy:
+		return account.QuotaModeWebImageEdit
+	default:
+		// Empty and auto tiers are deliberately treated as Basic, matching the
+		// Web adapter's conservative capability normalization.
+		return account.QuotaModeWebImagePro
+	}
 }
 
 func (r *AccountRepository) ListRoutingAccountOverlays(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel string) (account.RoutingOverlaySnapshot, error) {
@@ -555,7 +747,7 @@ func (r *AccountRepository) ListRoutingAccountOverlays(ctx context.Context, prov
 	var states []accountModelSyncStateModel
 	if err := r.db.db.WithContext(ctx).
 		Table("account_model_sync_states AS state").
-		Select("state.*").
+		Select("state.account_id").
 		Joins("JOIN provider_accounts AS account ON account.id = state.account_id").
 		Where("account.provider = ? AND account.enabled = TRUE AND state.last_success_at IS NOT NULL", provider).
 		Find(&states).Error; err != nil {
@@ -570,7 +762,7 @@ func (r *AccountRepository) ListRoutingAccountOverlays(ctx context.Context, prov
 	var capabilities []accountModelCapabilityModel
 	if err := r.db.db.WithContext(ctx).
 		Table("account_model_capabilities AS capability").
-		Select("capability.*").
+		Select("capability.account_id").
 		Joins("JOIN provider_accounts AS account ON account.id = capability.account_id").
 		Where("account.provider = ? AND account.enabled = TRUE AND capability.upstream_model = ?", provider, upstreamModel).
 		Find(&capabilities).Error; err != nil {
@@ -585,7 +777,7 @@ func (r *AccountRepository) ListRoutingAccountOverlays(ctx context.Context, prov
 	var blockRows []accountModelQuotaBlockModel
 	if err := r.db.db.WithContext(ctx).
 		Table("account_model_quota_blocks AS block").
-		Select("block.*").
+		Select("block.account_id", "block.upstream_model", "block.reason", "block.cooldown_until", "block.updated_at").
 		Joins("JOIN provider_accounts AS account ON account.id = block.account_id").
 		Where("account.provider = ? AND account.enabled = TRUE AND block.upstream_model = ? AND block.cooldown_until > ?", provider, upstreamModel, time.Now().UTC()).
 		Find(&blockRows).Error; err != nil {
@@ -1174,6 +1366,9 @@ func upsertKnownAccountByIdentity(tx *gorm.DB, value account.Credential, existin
 		if err := tx.Save(&row).Error; err != nil {
 			return repository.AccountUpsertResult{}, accountModel{}, err
 		}
+		if _, err := deleteInvalidEgressLeaseBlocksForAccount(tx, row); err != nil {
+			return repository.AccountUpsertResult{}, accountModel{}, err
+		}
 		if err := saveAccountRelations(tx, value, row.ID); err != nil {
 			return repository.AccountUpsertResult{}, accountModel{}, err
 		}
@@ -1222,6 +1417,9 @@ func (r *AccountRepository) Update(ctx context.Context, value account.Credential
 		row.CreatedAt = existing.CreatedAt
 		applyReauthMarkedAtTransition(&row, existing)
 		if err := tx.Save(&row).Error; err != nil {
+			return err
+		}
+		if _, err := deleteInvalidEgressLeaseBlocksForAccount(tx, row); err != nil {
 			return err
 		}
 		return saveAccountRelations(tx, value, row.ID)
@@ -1419,6 +1617,11 @@ func (r *AccountRepository) UpdateMany(ctx context.Context, providerValue accoun
 			}
 			updated += result.RowsAffected
 		}
+		if providerValue == account.ProviderBuild && updates.Enabled != nil && !*updates.Enabled {
+			if err := tx.Where("account_id IN ?", ids).Delete(&accountEgressLeaseBlockModel{}).Error; err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -1446,10 +1649,32 @@ func (r *AccountRepository) UpdateEgressBindings(ctx context.Context, providerVa
 		values["egress_assignment_mode"] = string(mode)
 		values["egress_assigned_at"] = assignedAt.UTC()
 	}
-	result := r.db.db.WithContext(ctx).Model(&accountModel{}).
-		Where("provider = ? AND id IN ?", providerValue, ids).
-		Updates(values)
-	return result.RowsAffected, mapError(result.Error)
+	var updated int64
+	var clearedLeaseBlocks int64
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&accountModel{}).Where("provider = ? AND id IN ?", providerValue, ids).Updates(values)
+		if result.Error != nil {
+			return result.Error
+		}
+		updated = result.RowsAffected
+		if providerValue != account.ProviderBuild {
+			return nil
+		}
+		query := tx.Where("account_id IN ?", ids)
+		if nodeID != nil {
+			query = query.Where("node_id <> ?", *nodeID)
+		}
+		deleted := query.Delete(&accountEgressLeaseBlockModel{})
+		if deleted.Error != nil {
+			return deleted.Error
+		}
+		clearedLeaseBlocks = deleted.RowsAffected
+		return nil
+	})
+	if err == nil && clearedLeaseBlocks > 0 {
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountEgressLeaseChanged, Provider: providerValue})
+	}
+	return updated, mapError(err)
 }
 
 // ListEgressAssignments returns all accounts for one provider with their
@@ -1556,6 +1781,7 @@ func (r *AccountRepository) ListAutoCleanReauthCandidates(ctx context.Context, m
 	query := r.db.db.WithContext(ctx).Model(&accountModel{}).
 		Select("id").
 		Where("auth_status = ? AND reauth_marked_at IS NOT NULL AND reauth_marked_at < ?", account.AuthStatusReauthRequired, markedBefore.UTC()).
+		Where(accountUnclassifiedRefreshReauthPredicate).
 		Where("NOT EXISTS (SELECT 1 FROM media_jobs job WHERE job.account_id = provider_accounts.id AND job.status IN ?)", []string{string(media.StatusQueued), string(media.StatusInProgress)})
 	if afterID > 0 {
 		query = query.Where("id > ?", afterID)
@@ -1587,7 +1813,8 @@ func (r *AccountRepository) DeleteAutoCleanReauthCandidates(ctx context.Context,
 
 		var lockedIDs []uint64
 		lockQuery := tx.Model(&accountModel{}).Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id IN ? AND auth_status = ? AND reauth_marked_at IS NOT NULL AND reauth_marked_at < ?", deletable, account.AuthStatusReauthRequired, markedBefore.UTC())
+			Where("id IN ? AND auth_status = ? AND reauth_marked_at IS NOT NULL AND reauth_marked_at < ?", deletable, account.AuthStatusReauthRequired, markedBefore.UTC()).
+			Where(accountUnclassifiedRefreshReauthPredicate)
 		if !includeDisabled {
 			lockQuery = lockQuery.Where("enabled = ?", true)
 		}
@@ -1602,7 +1829,8 @@ func (r *AccountRepository) DeleteAutoCleanReauthCandidates(ctx context.Context,
 		if len(lockedIDs) == 0 {
 			return nil
 		}
-		deletion := tx.Where("id IN ? AND auth_status = ? AND reauth_marked_at IS NOT NULL AND reauth_marked_at < ?", lockedIDs, account.AuthStatusReauthRequired, markedBefore.UTC())
+		deletion := tx.Where("id IN ? AND auth_status = ? AND reauth_marked_at IS NOT NULL AND reauth_marked_at < ?", lockedIDs, account.AuthStatusReauthRequired, markedBefore.UTC()).
+			Where(accountUnclassifiedRefreshReauthPredicate)
 		if !includeDisabled {
 			deletion = deletion.Where("enabled = ?", true)
 		}
@@ -1768,17 +1996,22 @@ func applyAssociationFilter(query *gorm.DB, providerValue, association string) *
 	}
 }
 
-func (r *AccountRepository) UpdateTokens(ctx context.Context, id uint64, accessToken, refreshToken string, expiresAt time.Time) (account.Credential, error) {
+func (r *AccountRepository) UpdateTokens(ctx context.Context, id uint64, accessToken, refreshToken string, expiresAt time.Time, buildBotFlagSource int) (account.Credential, error) {
 	now := time.Now().UTC()
 	refreshDueAt := account.CredentialRefreshDueAt(id, expiresAt)
-	updates := map[string]any{
-		"encrypted_primary": accessToken, "expires_at": expiresAt, "refresh_due_at": refreshDueAt,
-		"last_refresh_at": now, "refresh_failures": 0, "last_refresh_error_status": 0, "last_refresh_error": "", "last_refresh_error_message": "", "last_refresh_error_response": "", "refresh_permanent": false, "updated_at": now,
-	}
-	if refreshToken != "" {
-		updates["encrypted_refresh"] = refreshToken
-	}
 	if err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var providerRow struct{ Provider string }
+		if err := tx.Model(&accountModel{}).Select("provider").Where("id = ?", id).Take(&providerRow).Error; err != nil {
+			return err
+		}
+		updates := map[string]any{
+			"encrypted_primary": accessToken, "expires_at": expiresAt, "refresh_due_at": refreshDueAt,
+			"build_bot_flag_source": normalizeBuildBotFlagSource(account.Provider(providerRow.Provider), buildBotFlagSource),
+			"last_refresh_at":       now, "refresh_failures": 0, "refresh_unclassified_auth_failures": 0, "last_refresh_error_status": 0, "last_refresh_error": "", "last_refresh_error_message": "", "last_refresh_error_response": "", "refresh_permanent": false, "updated_at": now,
+		}
+		if refreshToken != "" {
+			updates["encrypted_refresh"] = refreshToken
+		}
 		if err := tx.Model(&accountCredentialModel{}).Where("account_id = ?", id).Updates(updates).Error; err != nil {
 			return err
 		}
@@ -1885,7 +2118,8 @@ func (r *AccountRepository) NextCredentialRefreshDueAt(ctx context.Context) (*ti
 func (r *AccountRepository) UpdateCredentialRefreshFailure(ctx context.Context, id uint64, failure repository.CredentialRefreshFailure) error {
 	err := r.db.db.WithContext(ctx).Model(&accountCredentialModel{}).Where("account_id = ?", id).Updates(map[string]any{
 		"refresh_due_at": failure.RetryAt.UTC(), "refresh_failures": max(0, failure.Count),
-		"last_refresh_error_status": max(0, failure.Status), "last_refresh_error": truncate(failure.Code, 100),
+		"refresh_unclassified_auth_failures": max(0, failure.UnclassifiedAuthFailureCount),
+		"last_refresh_error_status":          max(0, failure.Status), "last_refresh_error": truncate(failure.Code, 100),
 		"last_refresh_error_message": truncate(failure.Message, 512), "last_refresh_error_response": truncate(failure.Response, 4096),
 		"refresh_permanent": failure.Permanent, "updated_at": time.Now().UTC(),
 	}).Error
@@ -1933,17 +2167,43 @@ func (r *AccountRepository) MarkBuildAPIFallback(ctx context.Context, id uint64,
 	return nil
 }
 
-func (r *AccountRepository) UpdateHealth(ctx context.Context, id uint64, failureCount int, cooldownUntil *time.Time, lastError string, success bool) error {
-	updates := map[string]any{"failure_count": failureCount, "cooldown_until": cooldownUntil, "last_error": truncate(lastError, 512)}
+func (r *AccountRepository) UpdateHealth(ctx context.Context, id uint64, provider account.Provider, failureCount int, cooldownUntil *time.Time, lastError string, success bool) error {
+	if id == 0 || !provider.IsValid() {
+		return repository.ErrNotFound
+	}
+	failureCount = max(0, failureCount)
+	lastError = truncate(lastError, 512)
+	updates := map[string]any{"failure_count": failureCount, "cooldown_until": cooldownUntil, "last_error": lastError}
 	if success {
 		now := time.Now().UTC()
 		updates["last_used_at"] = &now
 	}
-	err := r.db.db.WithContext(ctx).Model(&accountModel{}).Where("id = ?", id).Updates(updates).Error
-	if err == nil && !success {
-		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, AccountID: id})
+	result := r.db.db.WithContext(ctx).Model(&accountModel{}).Where("id = ? AND provider = ?", id, provider).Updates(updates)
+	if result.Error != nil {
+		return mapError(result.Error)
 	}
-	return err
+	if result.RowsAffected == 0 {
+		return repository.ErrNotFound
+	}
+	r.notifyInvalidation(ctx, repository.InvalidationEvent{
+		Kind: repository.InvalidationAccountHealthChanged, Provider: provider, AccountID: id,
+		FailureCount: failureCount, CooldownUntil: cooldownUntil, HealthMarker: account.NormalizeHealthMarker(lastError),
+	})
+	return nil
+}
+
+func (r *AccountRepository) TouchLastUsed(ctx context.Context, id uint64, usedAt time.Time) error {
+	if id == 0 || usedAt.IsZero() {
+		return repository.ErrNotFound
+	}
+	result := r.db.db.WithContext(ctx).Model(&accountModel{}).Where("id = ?", id).Update("last_used_at", usedAt.UTC())
+	if result.Error != nil {
+		return mapError(result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return repository.ErrNotFound
+	}
+	return nil
 }
 
 func (r *AccountRepository) UpsertModelQuotaBlock(ctx context.Context, value account.ModelQuotaBlock) error {
@@ -1968,6 +2228,181 @@ func (r *AccountRepository) UpsertModelQuotaBlock(ctx context.Context, value acc
 		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountModelQuotaChanged, AccountID: value.AccountID, UpstreamModel: value.UpstreamModel})
 	}
 	return err
+}
+
+func egressLeaseBlockFromModel(row accountEgressLeaseBlockModel) account.EgressLeaseBlock {
+	return account.EgressLeaseBlock{
+		AccountID: row.AccountID, NodeID: row.NodeID, Reason: row.Reason, Version: row.Version,
+		CooldownUntil: row.CooldownUntil.UTC(), UpdatedAt: row.UpdatedAt.UTC(),
+	}
+}
+
+// ListEgressLeaseBlocks returns the durable guard-owned lease state, including
+// expired rows. The sidecar uses expired rows for recovery reconciliation; the
+// selector independently ignores them after CooldownUntil as a fail-safe.
+func (r *AccountRepository) ListEgressLeaseBlocks(ctx context.Context, limit int, after *account.EgressLeaseBlockCursor) ([]account.EgressLeaseBlock, error) {
+	if limit <= 0 || limit > 1001 {
+		return nil, repository.ErrConflict
+	}
+	var rows []accountEgressLeaseBlockModel
+	query := r.db.db.WithContext(ctx).
+		Table("account_egress_lease_blocks AS block").Select("block.*").
+		Joins("JOIN provider_accounts AS account ON account.id = block.account_id").
+		Joins("JOIN egress_nodes AS node ON node.id = block.node_id").
+		Where("account.provider = ? AND account.enabled = ? AND account.auth_status = ? AND account.egress_node_id = block.node_id AND node.enabled = ? AND node.scope = ?", account.ProviderBuild, true, account.AuthStatusActive, true, "grok_build").
+		Order("block.cooldown_until ASC, block.account_id ASC, block.node_id ASC").Limit(limit)
+	if after != nil {
+		cursorTime := after.CooldownUntil.UTC()
+		query = query.Where(
+			"block.cooldown_until > ? OR (block.cooldown_until = ? AND (block.account_id > ? OR (block.account_id = ? AND block.node_id > ?)))",
+			cursorTime, cursorTime, after.AccountID, after.AccountID, after.NodeID,
+		)
+	}
+	if err := query.Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	values := make([]account.EgressLeaseBlock, 0, len(rows))
+	for _, row := range rows {
+		values = append(values, egressLeaseBlockFromModel(row))
+	}
+	return values, nil
+}
+
+func deleteInvalidEgressLeaseBlocksForAccount(tx *gorm.DB, row accountModel) (int64, error) {
+	if account.Provider(row.Provider) != account.ProviderBuild {
+		return 0, nil
+	}
+	query := tx.Where("account_id = ?", row.ID)
+	if row.Enabled && account.AuthStatus(row.AuthStatus) == account.AuthStatusActive && row.EgressNodeID != nil {
+		query = query.Where("node_id <> ?", *row.EgressNodeID)
+	}
+	result := query.Delete(&accountEgressLeaseBlockModel{})
+	return result.RowsAffected, result.Error
+}
+
+func (r *AccountRepository) PruneInvalidEgressLeaseBlocks(ctx context.Context, limit int) (int64, error) {
+	if limit < 1 || limit > 1000 {
+		return 0, repository.ErrConflict
+	}
+	var rows []accountEgressLeaseBlockModel
+	err := r.db.db.WithContext(ctx).
+		Table("account_egress_lease_blocks AS block").Select("block.*").
+		Joins("LEFT JOIN provider_accounts AS account ON account.id = block.account_id").
+		Joins("LEFT JOIN egress_nodes AS node ON node.id = block.node_id").
+		Where("account.id IS NULL OR account.provider <> ? OR account.enabled <> ? OR account.auth_status <> ? OR account.egress_node_id IS NULL OR account.egress_node_id <> block.node_id OR node.id IS NULL OR node.enabled <> ? OR node.scope <> ?", account.ProviderBuild, true, account.AuthStatusActive, true, "grok_build").
+		Order("block.cooldown_until ASC, block.account_id ASC, block.node_id ASC").Limit(limit).Find(&rows).Error
+	if err != nil || len(rows) == 0 {
+		return 0, err
+	}
+	var deleted int64
+	err = r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for start := 0; start < len(rows); start += 400 {
+			end := min(start+400, len(rows))
+			pairs := make([][]any, 0, end-start)
+			for _, row := range rows[start:end] {
+				pairs = append(pairs, []any{row.AccountID, row.NodeID})
+			}
+			result := tx.Where("(account_id, node_id) IN ?", pairs).Delete(&accountEgressLeaseBlockModel{})
+			if result.Error != nil {
+				return result.Error
+			}
+			deleted += result.RowsAffected
+		}
+		return nil
+	})
+	if err == nil && deleted > 0 {
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountEgressLeaseChanged, Provider: account.ProviderBuild})
+	}
+	return deleted, err
+}
+
+func (r *AccountRepository) DeleteEgressLeaseBlocksByNodes(ctx context.Context, nodeIDs []uint64) (int64, error) {
+	if len(nodeIDs) == 0 {
+		return 0, nil
+	}
+	result := r.db.db.WithContext(ctx).Where("node_id IN ?", nodeIDs).Delete(&accountEgressLeaseBlockModel{})
+	if result.Error == nil && result.RowsAffected > 0 {
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountEgressLeaseChanged, Provider: account.ProviderBuild})
+	}
+	return result.RowsAffected, result.Error
+}
+
+// UpsertEgressLeaseBlock atomically verifies that the Build account is still
+// bound to the requested node. A shorter concurrent hold cannot replace a
+// longer one or rotate its CAS version.
+func (r *AccountRepository) UpsertEgressLeaseBlock(ctx context.Context, value account.EgressLeaseBlock) (account.EgressLeaseBlock, error) {
+	value.Reason = strings.TrimSpace(value.Reason)
+	value.Version = strings.TrimSpace(value.Version)
+	if value.AccountID == 0 || value.NodeID == 0 || value.Reason == "" || len(value.Version) < 16 || len(value.Version) > 64 || value.CooldownUntil.IsZero() {
+		return account.EgressLeaseBlock{}, repository.ErrConflict
+	}
+	value.Reason = truncate(value.Reason, 100)
+	value.CooldownUntil = value.CooldownUntil.UTC()
+	value.UpdatedAt = time.Now().UTC()
+	stored := value
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var owner accountModel
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id", "provider", "enabled", "auth_status", "egress_node_id").First(&owner, value.AccountID).Error; err != nil {
+			return mapError(err)
+		}
+		if account.Provider(owner.Provider) != account.ProviderBuild || !owner.Enabled || account.AuthStatus(owner.AuthStatus) != account.AuthStatusActive || owner.EgressNodeID == nil || *owner.EgressNodeID != value.NodeID {
+			return repository.ErrConflict
+		}
+		var existing accountEgressLeaseBlockModel
+		load := tx.Where("account_id = ? AND node_id = ?", value.AccountID, value.NodeID).Limit(1).Find(&existing)
+		if load.Error != nil {
+			return load.Error
+		}
+		if load.RowsAffected > 0 && existing.CooldownUntil.After(value.CooldownUntil) {
+			stored = egressLeaseBlockFromModel(existing)
+			return nil
+		}
+		row := accountEgressLeaseBlockModel{
+			AccountID: value.AccountID, NodeID: value.NodeID, Reason: value.Reason, Version: value.Version,
+			CooldownUntil: value.CooldownUntil, UpdatedAt: value.UpdatedAt,
+		}
+		created := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "account_id"}, {Name: "node_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{"reason", "version", "cooldown_until", "updated_at"}),
+			Where: clause.Where{Exprs: []clause.Expression{clause.Expr{
+				SQL: "account_egress_lease_blocks.cooldown_until <= excluded.cooldown_until",
+			}}},
+		}).Create(&row)
+		if created.Error != nil {
+			return created.Error
+		}
+		if created.RowsAffected == 0 {
+			if err := tx.Where("account_id = ? AND node_id = ?", value.AccountID, value.NodeID).First(&existing).Error; err != nil {
+				return err
+			}
+			stored = egressLeaseBlockFromModel(existing)
+			return nil
+		}
+		stored = egressLeaseBlockFromModel(row)
+		return nil
+	})
+	if err == nil {
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountEgressLeaseChanged, Provider: account.ProviderBuild, AccountID: value.AccountID})
+	}
+	return stored, err
+}
+
+// DeleteEgressLeaseBlock uses the opaque version as a compare-and-swap token,
+// so a stale recovery probe cannot clear a newer quarantine.
+func (r *AccountRepository) DeleteEgressLeaseBlock(ctx context.Context, accountID, nodeID uint64, version string) (bool, error) {
+	version = strings.TrimSpace(version)
+	if accountID == 0 || nodeID == 0 || version == "" {
+		return false, repository.ErrConflict
+	}
+	result := r.db.db.WithContext(ctx).Where("account_id = ? AND node_id = ? AND version = ?", accountID, nodeID, version).Delete(&accountEgressLeaseBlockModel{})
+	if result.Error != nil {
+		return false, result.Error
+	}
+	if result.RowsAffected == 1 {
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountEgressLeaseChanged, Provider: account.ProviderBuild, AccountID: accountID})
+		return true, nil
+	}
+	return false, nil
 }
 
 func (r *AccountRepository) PruneExpiredModelQuotaBlocks(ctx context.Context, now time.Time, limit int) (int64, error) {
@@ -2083,11 +2518,11 @@ func (r *AccountRepository) ClaimQuotaProbe(ctx context.Context, accountID uint6
 }
 
 func (r *AccountRepository) ClearQuotaRecovery(ctx context.Context, accountID uint64) error {
-	err := r.db.db.WithContext(ctx).Delete(&quotaRecoveryModel{}, "account_id = ?", accountID).Error
-	if err == nil {
+	result := r.db.db.WithContext(ctx).Delete(&quotaRecoveryModel{}, "account_id = ?", accountID)
+	if result.Error == nil && result.RowsAffected > 0 {
 		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountRecoveryChanged, AccountID: accountID})
 	}
-	return err
+	return result.Error
 }
 
 func (r *AccountRepository) ResetQuotaState(ctx context.Context, provider account.Provider, accountIDs []uint64) error {
@@ -2173,7 +2608,7 @@ func (r *AccountRepository) GetQuotaWindows(ctx context.Context, accountIDs []ui
 }
 
 func (r *AccountRepository) SaveQuotaWindows(ctx context.Context, accountID uint64, tier account.WebTier, syncedAt time.Time, values []account.QuotaWindow) error {
-	err := r.saveQuotaWindows(ctx, accountID, tier, syncedAt, values, false)
+	err := r.saveQuotaWindows(ctx, accountID, tier, syncedAt, values, false, nil)
 	if err == nil {
 		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountQuotaChanged, AccountID: accountID})
 	}
@@ -2181,14 +2616,48 @@ func (r *AccountRepository) SaveQuotaWindows(ctx context.Context, accountID uint
 }
 
 func (r *AccountRepository) ReplaceQuotaWindows(ctx context.Context, accountID uint64, tier account.WebTier, syncedAt time.Time, values []account.QuotaWindow) error {
-	err := r.saveQuotaWindows(ctx, accountID, tier, syncedAt, values, true)
+	err := r.saveQuotaWindows(ctx, accountID, tier, syncedAt, values, true, nil)
 	if err == nil {
 		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountQuotaChanged, AccountID: accountID})
 	}
 	return err
 }
 
-func (r *AccountRepository) saveQuotaWindows(ctx context.Context, accountID uint64, tier account.WebTier, syncedAt time.Time, values []account.QuotaWindow, replace bool) error {
+func (r *AccountRepository) ReplaceQuotaWindowGroup(ctx context.Context, accountID uint64, syncedAt time.Time, modes []string, values []account.QuotaWindow) error {
+	allowed := make(map[string]struct{}, len(modes))
+	cleanModes := make([]string, 0, len(modes))
+	for _, mode := range modes {
+		mode = strings.TrimSpace(mode)
+		if mode == "" {
+			return repository.ErrConflict
+		}
+		if _, exists := allowed[mode]; !exists {
+			allowed[mode] = struct{}{}
+			cleanModes = append(cleanModes, mode)
+		}
+	}
+	if accountID == 0 || len(cleanModes) == 0 {
+		return repository.ErrConflict
+	}
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		mode := strings.TrimSpace(value.Mode)
+		if _, ok := allowed[mode]; !ok {
+			return repository.ErrConflict
+		}
+		if _, duplicate := seen[mode]; duplicate {
+			return repository.ErrConflict
+		}
+		seen[mode] = struct{}{}
+	}
+	err := r.saveQuotaWindows(ctx, accountID, "", syncedAt, values, false, cleanModes)
+	if err == nil {
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountQuotaChanged, AccountID: accountID})
+	}
+	return err
+}
+
+func (r *AccountRepository) saveQuotaWindows(ctx context.Context, accountID uint64, tier account.WebTier, syncedAt time.Time, values []account.QuotaWindow, replace bool, replaceModes []string) error {
 	return r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if tier != "" {
 			profile := webAccountProfileModel{AccountID: accountID, Tier: string(tier), SyncedAt: &syncedAt}
@@ -2198,6 +2667,10 @@ func (r *AccountRepository) saveQuotaWindows(ctx context.Context, accountID uint
 		}
 		if replace {
 			if err := tx.Where("account_id = ?", accountID).Delete(&quotaWindowModel{}).Error; err != nil {
+				return err
+			}
+		} else if len(replaceModes) > 0 {
+			if err := tx.Where("account_id = ? AND mode IN ?", accountID, replaceModes).Delete(&quotaWindowModel{}).Error; err != nil {
 				return err
 			}
 		}

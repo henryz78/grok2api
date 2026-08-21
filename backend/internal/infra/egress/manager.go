@@ -137,41 +137,42 @@ func (l *Lease) Release() {
 }
 
 type Manager struct {
-	repository           repository.EgressRepository
-	cipher               *security.Cipher
-	logger               *slog.Logger
-	nodeMu               sync.RWMutex
-	clientMu             sync.RWMutex
-	clearanceMu          sync.Mutex
-	operationsMu         sync.RWMutex
-	clients              map[clientCacheKey]cachedClient
-	inflight             sync.Map
-	nodes                map[domain.Scope]cachedNodeSnapshot
-	healthyNodes         map[uint64]time.Time
-	nodeVersions         map[domain.Scope]uint64
-	nodeLoads            singleflight.Group
-	clientLoads          singleflight.Group
-	clientVersions       map[uint64]uint64
-	clientGeneration     uint64
-	buildHeaderTimeout   atomic.Int64
-	accountIsolated      atomic.Bool
-	operationsConfig     cachedOperationsConfig
-	operationsConfigLoad singleflight.Group
-	operationsConfigVer  uint64
-	failureProbeMu       sync.Mutex
-	failureProber        FailureProber
-	failureProbes        map[uint64]failureProbeState
-	lastClientCleanup    time.Time
-	clearanceLoads       singleflight.Group
-	clearanceConfig      ClearanceConfig
-	clearanceVersion     uint64
-	clearances           map[string]clearanceState
-	lastClearanceCleanup time.Time
-	solver               clearanceSolver
-	clearanceLock        repository.DistributedLock
-	newBuildClient       func(string, time.Duration) (requestClient, error)
-	newBuildEnvClient    func(time.Duration) (requestClient, error)
-	newBrowserClient     func(string, string) (*browserClient, error)
+	repository             repository.EgressRepository
+	cipher                 *security.Cipher
+	logger                 *slog.Logger
+	nodeMu                 sync.RWMutex
+	clientMu               sync.RWMutex
+	clearanceMu            sync.Mutex
+	operationsMu           sync.RWMutex
+	clients                map[clientCacheKey]cachedClient
+	inflight               sync.Map
+	nodes                  map[domain.Scope]cachedNodeSnapshot
+	healthyNodes           map[uint64]time.Time
+	nodeVersions           map[domain.Scope]uint64
+	nodeLoads              singleflight.Group
+	clientLoads            singleflight.Group
+	clientVersions         map[uint64]uint64
+	clientGeneration       uint64
+	buildHeaderTimeout     atomic.Int64
+	buildStreamIdleTimeout atomic.Int64
+	accountIsolated        atomic.Bool
+	operationsConfig       cachedOperationsConfig
+	operationsConfigLoad   singleflight.Group
+	operationsConfigVer    uint64
+	failureProbeMu         sync.Mutex
+	failureProber          FailureProber
+	failureProbes          map[uint64]failureProbeState
+	lastClientCleanup      time.Time
+	clearanceLoads         singleflight.Group
+	clearanceConfig        ClearanceConfig
+	clearanceVersion       uint64
+	clearances             map[string]clearanceState
+	lastClearanceCleanup   time.Time
+	solver                 clearanceSolver
+	clearanceLock          repository.DistributedLock
+	newBuildClient         func(string, time.Duration) (requestClient, error)
+	newBuildEnvClient      func(time.Duration) (requestClient, error)
+	newBrowserClient       func(string, string) (*browserClient, error)
 }
 
 type clearanceState struct {
@@ -234,6 +235,7 @@ func NewManager(repository repository.EgressRepository, cipher *security.Cipher)
 		clearanceConfig: ClearanceConfig{Mode: "manual", TargetURL: "https://grok.com", Timeout: time.Minute, RefreshInterval: 10 * time.Minute},
 	}
 	manager.buildHeaderTimeout.Store(int64(settingsdomain.DefaultBuildResponseHeaderTimeout))
+	manager.buildStreamIdleTimeout.Store(int64(settingsdomain.DefaultBuildStreamIdleTimeout))
 	return manager
 }
 
@@ -348,6 +350,22 @@ func (m *Manager) UpdateBuildResponseHeaderTimeout(value time.Duration) {
 	}
 	m.clientMu.Unlock()
 	closeRequestClients(stale)
+}
+
+// UpdateBuildStreamIdleTimeout affects subsequent Build streams. Active
+// response bodies retain the deadline captured by their existing wrapper and
+// are not interrupted; the underlying HTTP connection pool is unchanged.
+func (m *Manager) UpdateBuildStreamIdleTimeout(value time.Duration) {
+	if value <= 0 {
+		value = settingsdomain.DefaultBuildStreamIdleTimeout
+	}
+	m.buildStreamIdleTimeout.Store(int64(value))
+}
+
+// BuildStreamIdleTimeout returns the configured stream idle deadline for Grok
+// Build responses. Returns zero when idle enforcement is disabled.
+func (m *Manager) BuildStreamIdleTimeout() time.Duration {
+	return time.Duration(m.buildStreamIdleTimeout.Load())
 }
 
 // UpdateAccountIsolatedConnections toggles per-account upstream connection pools.
@@ -794,7 +812,8 @@ func decodeProbeIP(body []byte) (string, error) {
 
 func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity string, allowDirect bool, encryptedCredentialCookies string, boundNodeID uint64) (*Lease, bool, error) {
 	now := time.Now().UTC()
-	managedClearance := isGrokWebScope(scope) && m.clearanceMode() == "flaresolverr"
+	clearanceMode := m.clearanceMode()
+	managedClearance := isGrokWebScope(scope) && (clearanceMode == "flaresolverr" || clearanceMode == "on_demand")
 	configured := false
 	var available []domain.Node
 	if boundNodeID != 0 {
@@ -1609,6 +1628,9 @@ func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, node
 	if scope == domain.ScopeConsoleAsset && transportErr == nil && status == http.StatusForbidden {
 		return
 	}
+	if neterrorpkg.IsUpstreamStreamIdleTimeout(transportErr) {
+		return
+	}
 	if scope == domain.ScopeBuild && neterrorpkg.IsResponseHeaderTimeout(transportErr) {
 		return
 	}
@@ -1796,7 +1818,14 @@ func (m *Manager) ensureClearance(ctx context.Context, node domain.Node, proxyUR
 		state.lastUsedAt = now
 		m.clearances[key] = state
 	}
-	if cfg.Mode != "flaresolverr" {
+	if cfg.Mode == "on_demand" && !forceRefresh {
+		m.clearanceMu.Unlock()
+		if fallbackAllowed {
+			return fallback.Cookies, fallback.UserAgent, nil
+		}
+		return existingCookies, existingUserAgent, nil
+	}
+	if cfg.Mode != "flaresolverr" && cfg.Mode != "on_demand" {
 		m.clearanceMu.Unlock()
 		return existingCookies, existingUserAgent, nil
 	}
@@ -1822,7 +1851,7 @@ func (m *Manager) refreshNode(ctx context.Context, node domain.Node, proxyURL, k
 	solver := m.solver
 	lock := m.clearanceLock
 	m.clearanceMu.Unlock()
-	if cfg.Mode != "flaresolverr" {
+	if cfg.Mode != "flaresolverr" && cfg.Mode != "on_demand" {
 		return clearanceSolution{}, errors.New("FlareSolverr Clearance 未启用")
 	}
 	timeout := cfg.Timeout
@@ -1853,8 +1882,12 @@ func (m *Manager) refreshNode(ctx context.Context, node domain.Node, proxyURL, k
 			return clearanceSolution{}, errors.New("另一个实例正在刷新 Cloudflare Clearance")
 		}
 		defer release()
-		if !force {
-			if solution, refreshedAt, ok := m.loadPersistedClearance(ctx, node.ID, fingerprint, bindingFingerprint, interval); ok {
+		if solution, refreshedAt, ok := m.loadPersistedClearance(ctx, node.ID, fingerprint, bindingFingerprint, interval); ok {
+			// A peer may have refreshed the rejected Clearance immediately before
+			// this instance acquired the distributed lock. Reuse that newer result
+			// instead of performing a duplicate browser solve. A force refresh with
+			// no newer persisted generation must still reach the solver.
+			if !force || (!refreshAfter.IsZero() && refreshedAt.After(refreshAfter)) {
 				m.cacheClearance(key, solution, refreshedAt, solveVersion, fingerprint, bindingFingerprint, interval)
 				return solution, nil
 			}

@@ -16,6 +16,7 @@ import (
 
 	"github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	"github.com/chenyme/grok2api/backend/internal/pkg/netguard"
 )
 
 const (
@@ -24,14 +25,6 @@ const (
 	maxRemoteAttachmentURLLen = 8192
 )
 
-var blockedRemoteImagePrefixes = []netip.Prefix{
-	netip.MustParsePrefix("0.0.0.0/8"), netip.MustParsePrefix("100.64.0.0/10"),
-	netip.MustParsePrefix("192.0.0.0/24"), netip.MustParsePrefix("192.0.2.0/24"),
-	netip.MustParsePrefix("198.18.0.0/15"), netip.MustParsePrefix("198.51.100.0/24"),
-	netip.MustParsePrefix("203.0.113.0/24"), netip.MustParsePrefix("240.0.0.0/4"),
-	netip.MustParsePrefix("2001:db8::/32"),
-}
-
 var (
 	errInvalidChatAttachment = errors.New("对话附件无效")
 	errInvalidChatImage      = errors.New("对话图片无效")
@@ -39,8 +32,14 @@ var (
 )
 
 type uploadedFile struct {
-	ID  string
-	URI string
+	// ID is the best available generic attachment reference. Some upload
+	// responses only contain fileId or uploadId, which remain valid for chat
+	// attachment flows that already accept those references.
+	ID string
+	// MetadataID is populated only from fileMetadata.fileMetadataId. Current
+	// Imagine image-edit requests require this exact identifier in inputAssets.
+	MetadataID string
+	URI        string
 }
 
 type remoteImageTarget struct {
@@ -96,7 +95,7 @@ func (a *Adapter) prepareChatAttachments(ctx context.Context, cfg Config, lease 
 			return nil, err
 		}
 		if uploaded.ID == "" {
-			return nil, fmt.Errorf("上传附件成功但上游未返回 fileMetadataId")
+			return nil, fmt.Errorf("上传附件成功但上游未返回可用附件标识")
 		}
 		attachments = append(attachments, uploaded.ID)
 	}
@@ -383,15 +382,7 @@ func newRemoteImageTarget(original *url.URL, serverName string, address netip.Ad
 }
 
 func publicRemoteImageAddress(address netip.Addr) bool {
-	if !address.IsValid() || !address.IsGlobalUnicast() || address.IsPrivate() || address.IsLoopback() || address.IsLinkLocalUnicast() || address.IsMulticast() || address.IsUnspecified() {
-		return false
-	}
-	for _, prefix := range blockedRemoteImagePrefixes {
-		if prefix.Contains(address) {
-			return false
-		}
-	}
-	return true
+	return netguard.IsPublicAddress(address)
 }
 
 func imageFilename(value *url.URL, mimeType string) string {

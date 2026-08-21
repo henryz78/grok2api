@@ -165,6 +165,7 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.DELETE("/accounts", h.batchDelete)
 	router.PATCH("/accounts/:id", h.update)
 	router.DELETE("/accounts/:id", h.delete)
+	router.POST("/accounts/:id/clear-cooldown", h.clearCooldown)
 	router.POST("/accounts/:id/refresh-token", h.refreshToken)
 	router.POST("/accounts/:id/refresh-billing", h.refreshBilling)
 	router.POST("/accounts/:id/refresh-quota", h.refreshWebQuota)
@@ -273,6 +274,7 @@ type accountImportResponse struct {
 	Created    int `json:"created"`
 	Updated    int `json:"updated"`
 	Skipped    int `json:"skipped"`
+	Failed     int `json:"failed"`
 	Synced     int `json:"synced"`
 	SyncFailed int `json:"syncFailed"`
 }
@@ -306,6 +308,9 @@ type accountResponse struct {
 	FailureCount               int                     `json:"failureCount"`
 	CooldownUntil              *time.Time              `json:"cooldownUntil,omitempty"`
 	LastError                  string                  `json:"lastError,omitempty"`
+	// EnabledDoesNotClearCooldown is set on PATCH when enabled was changed
+	// while the account is still cooling. Toggling enabled is not a health reset.
+	EnabledDoesNotClearCooldown bool `json:"enabledDoesNotClearCooldown,omitempty"`
 	LastUsedAt                 *time.Time              `json:"lastUsedAt,omitempty"`
 	LinkedAccountID            uint64                  `json:"linkedAccountId,omitempty,string"`
 	LinkedName                 string                  `json:"linkedAccountName,omitempty"`
@@ -318,6 +323,7 @@ type accountResponse struct {
 	BuildSuperEntitled         bool                    `json:"buildSuperEntitled"`
 	BuildRouteMode             string                  `json:"buildRouteMode"`
 	BuildBotFlagged            bool                    `json:"buildBotFlagged"`
+	BuildBotFlagSource         int                     `json:"buildBotFlagSource,omitempty"`
 	EgressNodeID               uint64                  `json:"egressNodeId,omitempty,string"`
 	EgressAssignmentMode       string                  `json:"egressAssignmentMode,omitempty"`
 	ModelSyncFailed            bool                    `json:"modelSyncFailed,omitempty"`
@@ -1056,7 +1062,7 @@ func writeAccountEvent(c *gin.Context, event string, value any) error {
 }
 
 func (h *Handler) importFile(c *gin.Context, providerValue accountdomain.Provider) {
-	fileDescription := "账号凭据 JSON 或逐行 JSON 文本"
+	fileDescription := "账号凭据 JSON、逐行 JSON 或 refresh token 文本"
 	if providerValue == accountdomain.ProviderWeb {
 		fileDescription = "Grok Web JSON、逐行 JSON 或 SSO 文本"
 	} else if providerValue == accountdomain.ProviderConsole {
@@ -1084,7 +1090,7 @@ func (h *Handler) importFile(c *gin.Context, providerValue accountdomain.Provide
 		stream.WriteError("authImportFailed", "导入账号失败")
 		return
 	}
-	_ = stream.Write("complete", accountImportResponse{Created: result.Created, Updated: result.Updated, Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed})
+	_ = stream.Write("complete", accountImportResponse{Created: result.Created, Updated: result.Updated, Skipped: result.Skipped, Failed: result.Failed, Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed})
 }
 
 func readAccountImportDocuments(c *gin.Context, fileDescription string) ([][]byte, bool) {
@@ -1253,12 +1259,28 @@ func (h *Handler) update(c *gin.Context) {
 		return
 	}
 	result := newAccountResponse(value)
+	if value.EnabledChanged && result.CooldownUntil != nil && time.Now().UTC().Before(*result.CooldownUntil) {
+		result.EnabledDoesNotClearCooldown = true
+	}
 	if request.BuildSuperEntitled != nil {
 		if synchronizer, ok := h.sync.(accountModelSynchronizer); ok {
 			result.ModelSyncFailed = synchronizer.SyncModels(c.Request.Context(), id) != nil
 		}
 	}
 	response.Success(c, http.StatusOK, result)
+}
+
+func (h *Handler) clearCooldown(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	value, err := h.service.ClearCooldown(c.Request.Context(), id)
+	if err != nil {
+		h.writeServiceError(c, "accountClearCooldownFailed", err, http.StatusInternalServerError, "清除账号冷却失败")
+		return
+	}
+	response.Success(c, http.StatusOK, newAccountResponse(value))
 }
 
 func (h *Handler) delete(c *gin.Context) {
@@ -1494,6 +1516,7 @@ func newAccountResponse(value accountapp.View) accountResponse {
 		BuildSuperEntitled:         c.BuildSuperEntitled && c.Provider == accountdomain.ProviderBuild,
 		BuildRouteMode:             string(buildRouteMode),
 		BuildBotFlagged:            value.BuildBotFlagged && c.Provider == accountdomain.ProviderBuild,
+		BuildBotFlagSource:         buildBotFlagSourceResponse(c.Provider, value.BuildBotFlagged, value.BuildBotFlagSource),
 		EgressNodeID:               c.EgressNodeID,
 		EgressAssignmentMode:       string(c.EgressAssignmentMode),
 		Quota:                      newQuotaResponse(value.Quota), QuotaWindows: make([]quotaWindowResponse, 0, len(value.QuotaWindows)),
@@ -1522,6 +1545,16 @@ func newAccountResponse(value accountapp.View) accountResponse {
 		result.Billing = &billing
 	}
 	return result
+}
+
+func buildBotFlagSourceResponse(provider accountdomain.Provider, flagged bool, source int) int {
+	if provider != accountdomain.ProviderBuild || !flagged {
+		return 0
+	}
+	if source != 1 && source != 2 {
+		return 0
+	}
+	return source
 }
 
 func newQuotaResponse(value accountapp.QuotaView) quotaResponse {

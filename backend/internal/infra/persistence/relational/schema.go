@@ -12,16 +12,20 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/domain/media"
 	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const mediaJobInputMetadataPendingIndex = "CREATE INDEX IF NOT EXISTS idx_media_jobs_input_metadata_pending ON media_jobs(id) WHERE input_image_count IS NULL"
 
 const postgresSchemaMigrationLockID int64 = 0x47524f4b32415049
 
+const standaloneProxyProfileMigrationBatchSize = 100
+
 var schemaModels = []any{
 	&adminModel{},
 	&adminSessionModel{},
 	&egressSubscriptionSourceModel{},
+	&egressProxyProfileModel{},
 	&egressNodeModel{},
 	&egressOperationsConfigModel{},
 	&accountModel{},
@@ -38,6 +42,7 @@ var schemaModels = []any{
 	&accountModelCapabilityModel{},
 	&accountModelSyncStateModel{},
 	&accountModelQuotaBlockModel{},
+	&accountEgressLeaseBlockModel{},
 	&clientKeyModel{},
 	&clientKeyModelPermission{},
 	&billingReservationModel{},
@@ -62,6 +67,8 @@ var schemaIndexes = []string{
 	"CREATE INDEX IF NOT EXISTS idx_accounts_auto_clean_reauth ON provider_accounts(auth_status, reauth_marked_at, id)",
 	"CREATE INDEX IF NOT EXISTS idx_accounts_auto_clean_reauth_cursor ON provider_accounts(auth_status, enabled, id, reauth_marked_at)",
 	"CREATE INDEX IF NOT EXISTS idx_account_credentials_refresh_due ON account_credentials(refresh_due_at, account_id)",
+	"CREATE INDEX IF NOT EXISTS idx_account_credentials_build_bot_flag ON account_credentials(build_bot_flag_source, account_id)",
+	"CREATE INDEX IF NOT EXISTS idx_account_egress_lease_blocks_due ON account_egress_lease_blocks(cooldown_until, account_id, node_id)",
 	"CREATE INDEX IF NOT EXISTS idx_quota_windows_due ON account_quota_windows(remaining, reset_at, account_id)",
 	"CREATE INDEX IF NOT EXISTS idx_model_routes_public_id_lookup ON model_routes(public_id)",
 	// Catalog/discovered rows remain idempotent per API capability. One public
@@ -82,12 +89,14 @@ var schemaIndexes = []string{
 	"CREATE INDEX IF NOT EXISTS idx_billing_reservations_expiry ON billing_reservations(expires_at, client_key_id)",
 	"CREATE INDEX IF NOT EXISTS idx_egress_nodes_scope_health ON egress_nodes(scope, enabled, health DESC, id ASC)",
 	"CREATE INDEX IF NOT EXISTS idx_egress_nodes_probe_due ON egress_nodes(enabled, last_probed_at, id)",
+	"CREATE INDEX IF NOT EXISTS idx_egress_nodes_proxy_profile ON egress_nodes(proxy_profile_id, id)",
 	"CREATE INDEX IF NOT EXISTS idx_egress_sources_scope_name ON egress_subscription_sources(scope, LOWER(name), id)",
 	"CREATE INDEX IF NOT EXISTS idx_audits_created_id ON request_audits(created_at DESC, id DESC)",
 	"CREATE UNIQUE INDEX IF NOT EXISTS idx_audits_event_id ON request_audits(event_id) WHERE event_id <> ''",
 	"CREATE INDEX IF NOT EXISTS idx_audits_account_created_id ON request_audits(account_id, created_at DESC, id DESC)",
 	"CREATE INDEX IF NOT EXISTS idx_audits_status_created_id ON request_audits(status_code, created_at DESC, id DESC)",
 	"CREATE INDEX IF NOT EXISTS idx_audits_streaming_created_id ON request_audits(streaming, created_at DESC, id DESC)",
+	"CREATE INDEX IF NOT EXISTS idx_audits_provider_streaming_created_id ON request_audits(provider, streaming, created_at DESC, id DESC)",
 	"CREATE INDEX IF NOT EXISTS idx_audit_attempts_audit_number ON request_audit_attempts(audit_id, number)",
 	"CREATE INDEX IF NOT EXISTS idx_response_ownership_expires_id ON response_ownership(expires_at, response_id)",
 	"CREATE INDEX IF NOT EXISTS idx_response_ownership_account ON response_ownership(account_id)",
@@ -101,6 +110,7 @@ var schemaIndexes = []string{
 	"CREATE INDEX IF NOT EXISTS idx_media_jobs_usage_recovery ON media_jobs(status, usage_recorded_at, completed_at, id)",
 	"CREATE INDEX IF NOT EXISTS idx_media_assets_created ON media_assets(created_at DESC, id)",
 	"CREATE INDEX IF NOT EXISTS idx_media_assets_kind_created ON media_assets(kind, created_at DESC, id)",
+	"CREATE INDEX IF NOT EXISTS idx_media_assets_expires ON media_assets(expires_at, id) WHERE expires_at IS NOT NULL",
 	"CREATE INDEX IF NOT EXISTS idx_media_upload_tickets_expires ON media_upload_tickets(expires_at, consumed_at)",
 	"CREATE INDEX IF NOT EXISTS idx_media_jobs_result_asset ON media_jobs(result_asset_id) WHERE result_asset_id <> ''",
 	// Pending input metadata rows only; keeps startup backfill scans off the full table after migration completes.
@@ -127,6 +137,7 @@ func (d *Database) initializeSchema(ctx context.Context) error {
 	hadProviderScope := hadClientKeys && db.Migrator().HasColumn(&clientKeyModel{}, "ProviderScopeMask")
 	hadTierScope := hadClientKeys && db.Migrator().HasColumn(&clientKeyModel{}, "TierScopeMask")
 	hadLegacyAccountPool := hadClientKeys && db.Migrator().HasColumn("client_keys", "account_pool")
+	hadGlobalSubscriptionProxy := db.Migrator().HasTable("egress_operations_config") && db.Migrator().HasColumn("egress_operations_config", "encrypted_subscription_proxy_url")
 	// all 作用域会让 Build 与 Web 共用 UA、健康度和冷却状态，升级时直接移除旧节点。
 	if db.Migrator().HasTable(&egressNodeModel{}) {
 		if err := db.Where("scope = ?", "all").Delete(&egressNodeModel{}).Error; err != nil {
@@ -147,11 +158,22 @@ func (d *Database) initializeSchema(ctx context.Context) error {
 	if migrateErr != nil {
 		return fmt.Errorf("初始化数据库表: %w", migrateErr)
 	}
+	if hadGlobalSubscriptionProxy {
+		if err := d.migratePerSourceSubscriptionProxy(ctx); err != nil {
+			return fmt.Errorf("迁移代理订阅拉取代理: %w", err)
+		}
+	}
+	if err := d.migrateStandaloneEgressProxyProfiles(ctx); err != nil {
+		return fmt.Errorf("迁移独立出口代理配置: %w", err)
+	}
 	if err := d.migrateClientKeyAccountScopes(ctx, hadLegacyAccountPool, !hadProviderScope, !hadTierScope); err != nil {
 		return fmt.Errorf("迁移客户端 Key 调用范围: %w", err)
 	}
 	if err := d.migrateBuildResponseHeaderTimeout(ctx); err != nil {
 		return fmt.Errorf("迁移 Grok Build 响应头超时: %w", err)
+	}
+	if err := d.migrateProviderStreamIdleTimeouts(ctx); err != nil {
+		return fmt.Errorf("迁移 Provider 流式空闲超时: %w", err)
 	}
 	if err := d.ensureConsoleConstraints(ctx); err != nil {
 		return fmt.Errorf("迁移 Console 数据库约束: %w", err)
@@ -162,8 +184,14 @@ func (d *Database) initializeSchema(ctx context.Context) error {
 	if err := d.ensureAuditOperationConstraints(ctx); err != nil {
 		return fmt.Errorf("迁移请求审计操作约束: %w", err)
 	}
+	if err := d.ensureModelRouteCapabilityConstraints(ctx); err != nil {
+		return fmt.Errorf("迁移模型路由能力约束: %w", err)
+	}
 	if err := d.ensureMediaJobConstraints(ctx); err != nil {
 		return fmt.Errorf("迁移 media job 数据库约束: %w", err)
+	}
+	if err := d.migrateMediaJobOperations(ctx); err != nil {
+		return fmt.Errorf("迁移 media job 操作类型: %w", err)
 	}
 	if err := d.ensureMediaJobInputConstraint(ctx); err != nil {
 		return fmt.Errorf("迁移 media job 输入长度约束: %w", err)
@@ -211,6 +239,121 @@ func (d *Database) initializeSchema(ctx context.Context) error {
 	return nil
 }
 
+// migrateStandaloneEgressProxyProfiles promotes existing manually managed
+// node proxies to reusable configurations exactly once. Subscription-managed
+// nodes keep their source-owned proxy lifecycle.
+func (d *Database) migrateStandaloneEgressProxyProfiles(ctx context.Context) error {
+	for {
+		completed, err := d.migrateStandaloneEgressProxyProfileBatch(ctx)
+		if err != nil {
+			return err
+		}
+		if completed {
+			return nil
+		}
+	}
+}
+
+// migrateStandaloneEgressProxyProfileBatch keeps each resumable unit bounded.
+// Already-bound rows are excluded by the predicate, so a process restart can
+// safely continue without duplicating completed work.
+func (d *Database) migrateStandaloneEgressProxyProfileBatch(ctx context.Context) (bool, error) {
+	completed := false
+	err := d.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		config, err := lockEgressOperationsConfig(tx)
+		if err != nil {
+			return err
+		}
+		if config.ProxyProfileMigrationCompleted {
+			completed = true
+			return nil
+		}
+		var nodes []egressNodeModel
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("source_id IS NULL AND proxy_profile_id IS NULL AND encrypted_proxy_url <> ''").
+			Order("id ASC").Limit(standaloneProxyProfileMigrationBatchSize).Find(&nodes).Error; err != nil {
+			return err
+		}
+		if len(nodes) == 0 {
+			completed = true
+			return tx.Model(&egressOperationsConfigModel{}).Where("id = ?", config.ID).
+				Update("proxy_profile_migration_completed", true).Error
+		}
+		for _, node := range nodes {
+			suffix := fmt.Sprintf(" · %s #%d", migratedProxyProfileScopeName(node.Scope), node.ID)
+			name := truncate(strings.TrimSpace(node.Name), max(1, 160-len([]rune(suffix)))) + suffix
+			profile := egressProxyProfileModel{Name: name, EncryptedProxyURL: node.EncryptedProxyURL}
+			if err := tx.Create(&profile).Error; err != nil {
+				return err
+			}
+			result := tx.Model(&egressNodeModel{}).Where("id = ? AND proxy_profile_id IS NULL", node.ID).
+				Update("proxy_profile_id", profile.ID)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return fmt.Errorf("bind migrated proxy profile for egress node %d: row changed concurrently", node.ID)
+			}
+		}
+		return nil
+	})
+	return completed, err
+}
+
+func migratedProxyProfileScopeName(scope string) string {
+	switch scope {
+	case "grok_build":
+		return "Grok Build"
+	case "grok_web":
+		return "Grok Web"
+	case "grok_console":
+		return "Grok Console"
+	case "grok_web_asset":
+		return "Grok Web Assets"
+	case "grok_console_asset":
+		return "Grok Console Assets"
+	default:
+		return scope
+	}
+}
+
+func (d *Database) migratePerSourceSubscriptionProxy(ctx context.Context) error {
+	return d.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var legacy struct {
+			EncryptedProxyURL  string `gorm:"column:encrypted_subscription_proxy_url"`
+			MigrationCompleted bool   `gorm:"column:subscription_proxy_migration_completed"`
+		}
+		err := tx.Table("egress_operations_config").
+			Select("encrypted_subscription_proxy_url", "subscription_proxy_migration_completed").
+			Where("id = ?", 1).
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Take(&legacy).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if legacy.MigrationCompleted {
+			return nil
+		}
+		if strings.TrimSpace(legacy.EncryptedProxyURL) != "" {
+			if err := tx.Model(&egressSubscriptionSourceModel{}).Where("encrypted_proxy_url = ''").Updates(map[string]any{
+				"encrypted_proxy_url": legacy.EncryptedProxyURL,
+				"next_sync_at":        nil,
+				"last_sync_error":     "",
+			}).Error; err != nil {
+				return err
+			}
+		}
+		// Keep the encrypted legacy value for still-running old replicas and a
+		// rollback window. The marker prevents subsequent startups from applying
+		// it to sources that were later configured for direct fetching.
+		return tx.Table("egress_operations_config").Where("id = ?", 1).
+			Update("subscription_proxy_migration_completed", true).Error
+	})
+}
+
 // migrateClientKeyAccountScopes translates the short-lived account_pool
 // representation only when the corresponding scope columns are first added.
 func (d *Database) migrateClientKeyAccountScopes(ctx context.Context, hadLegacyAccountPool, providerScopeAdded, tierScopeAdded bool) error {
@@ -247,6 +390,59 @@ func (d *Database) migrateBuildResponseHeaderTimeout(ctx context.Context) error 
 			return nil
 		}
 		payload.Config.ProviderBuild.ResponseHeaderTimeout = settingsdomain.DefaultBuildResponseHeaderTimeout
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("encode runtime settings: %w", err)
+		}
+		result := db.Model(&runtimeSettingsModel{}).
+			Where("key = ? AND revision = ?", row.Key, row.Revision).
+			UpdateColumn("value_json", string(encoded))
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 1 {
+			return nil
+		}
+	}
+	return errors.New("runtime settings changed repeatedly during migration")
+}
+
+// migrateProviderStreamIdleTimeouts persists runtime defaults for settings rows
+// created before provider stream idle timeouts became configurable.
+func (d *Database) migrateProviderStreamIdleTimeouts(ctx context.Context) error {
+	db := d.db.WithContext(ctx)
+	for range 4 {
+		var row runtimeSettingsModel
+		if err := db.Where("key = ?", runtimeSettingsKey).First(&row).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		var payload runtimeSettingsPayload
+		if err := json.Unmarshal([]byte(row.ValueJSON), &payload); err != nil {
+			return fmt.Errorf("decode runtime settings: %w", err)
+		}
+		changed := false
+		if payload.Config.ProviderBuild.StreamIdleTimeout <= 0 {
+			payload.Config.ProviderBuild.StreamIdleTimeout = settingsdomain.DefaultBuildStreamIdleTimeout
+			changed = true
+		}
+		if payload.Config.ProviderWeb.StreamIdleTimeout <= 0 {
+			payload.Config.ProviderWeb.StreamIdleTimeout = settingsdomain.DefaultWebStreamIdleTimeout
+			changed = true
+		}
+		// ProviderConsole was introduced after runtime settings persistence. Keep
+		// a completely absent legacy section absent so applyDomainConfig can retain
+		// the current defaults instead of treating a timeout-only section as an
+		// explicitly configured (but invalid) Console provider.
+		if payload.Config.ProviderConsole != (settingsdomain.ProviderConsoleConfig{}) && payload.Config.ProviderConsole.StreamIdleTimeout <= 0 {
+			payload.Config.ProviderConsole.StreamIdleTimeout = settingsdomain.DefaultConsoleStreamIdleTimeout
+			changed = true
+		}
+		if !changed {
+			return nil
+		}
 		encoded, err := json.Marshal(payload)
 		if err != nil {
 			return fmt.Errorf("encode runtime settings: %w", err)
@@ -328,11 +524,19 @@ func (d *Database) ensureEgressAssetScopeConstraints(ctx context.Context) error 
 }
 
 // ensureAuditOperationConstraints upgrades existing databases so Codex remote
-// compaction can be recorded separately from ordinary Responses requests.
+// compaction and Console voice operations can be recorded separately.
 func (d *Database) ensureAuditOperationConstraints(ctx context.Context) error {
 	return d.ensureNamedConstraints(ctx, []consoleConstraint{
 		{model: &requestAuditModel{}, table: "request_audits", name: "chk_request_audits_operation"},
-	}, "compaction")
+	}, "tts")
+}
+
+// ensureModelRouteCapabilityConstraints upgrades existing databases so Console
+// TTS/STT/Realtime routes can be managed alongside image and video.
+func (d *Database) ensureModelRouteCapabilityConstraints(ctx context.Context) error {
+	return d.ensureNamedConstraints(ctx, []consoleConstraint{
+		{model: &modelRouteModel{}, table: "model_routes", name: "chk_model_routes_capability"},
+	}, "tts")
 }
 
 // ensureMediaJobConstraints 将历史仅允许 grok_web 的 media job CHECK 升级到支持 Build 与 Console 视频。
@@ -343,9 +547,43 @@ func (d *Database) ensureMediaJobConstraints(ctx context.Context) error {
 	}, "grok_console"); err != nil {
 		return err
 	}
-	return d.ensureNamedConstraints(ctx, []consoleConstraint{
+	if err := d.ensureNamedConstraints(ctx, []consoleConstraint{
 		{model: &mediaJobModel{}, table: "media_jobs", name: "chk_media_jobs_egress_scope"},
-	}, "grok_console")
+	}, "grok_console"); err != nil {
+		return err
+	}
+	for _, constraint := range []consoleConstraint{
+		{model: &mediaJobModel{}, table: "media_jobs", name: "chk_media_jobs_operation"},
+		{model: &mediaJobModel{}, table: "media_jobs", name: "chk_media_jobs_seconds"},
+		{model: &mediaJobModel{}, table: "media_jobs", name: "chk_media_jobs_size"},
+		{model: &mediaJobModel{}, table: "media_jobs", name: "chk_media_jobs_quality"},
+	} {
+		marker := "0"
+		if constraint.name == "chk_media_jobs_operation" {
+			marker = "extend"
+		}
+		if err := d.ensureNamedConstraints(ctx, []consoleConstraint{constraint}, marker); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateMediaJobOperations preserves queued and in-progress edit/extension
+// jobs created before media_jobs.operation existed. Those releases persisted
+// the operation only in the compact JSON metadata; AutoMigrate necessarily
+// fills the new non-null column with "generate", which must not change the
+// request semantics when a job is recovered after an upgrade.
+func (d *Database) migrateMediaJobOperations(ctx context.Context) error {
+	editPattern := `%"operation":"edit"%`
+	extendPattern := `%"operation":"extend"%`
+	return d.db.WithContext(ctx).Exec(
+		`UPDATE media_jobs
+		 SET operation = CASE WHEN input_json LIKE ? THEN ? ELSE ? END
+		 WHERE operation = ? AND (input_json LIKE ? OR input_json LIKE ?)`,
+		editPattern, media.VideoOperationEdit, media.VideoOperationExtend,
+		media.VideoOperationGenerate, editPattern, extendPattern,
+	).Error
 }
 
 // ensureMediaJobInputConstraint 允许异步视频任务持久化 Base64 首图。

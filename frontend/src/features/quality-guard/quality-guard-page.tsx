@@ -18,6 +18,9 @@ import { Label } from "@/components/ui/label";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { DegradeAccountsPanel } from "@/features/quality-guard/degrade-accounts-panel";
+import { ProbeProfilesPanel } from "@/features/quality-guard/probe-profiles-panel";
 import { getQualityGuardStatus, runQualityTest, updateQualityGuardPolicy, type QualityGuardEvent, type QualityGuardNodeState, type QualityGuardPolicy, type QualityGuardStatistics, type QualityGuardStatus, type QualityTestResult } from "@/features/quality-guard/quality-guard-api";
 import { createEgressNode, deleteEgressNodes, listAllEgressNodes, updateEgressNode, updateEgressNodesEnabled, type EgressNodeDTO, type EgressNodeInput } from "@/features/settings/settings-api";
 import { ErrorState } from "@/shared/components/data-state";
@@ -144,6 +147,7 @@ export function QualityGuardPage() {
   const fresh = isFresh(status);
   const guardedNodes = status?.nodes ?? {};
   const quarantined = Object.values(guardedNodes).filter((node) => node.disabled_by_guard).length;
+  const quarantinedLeases = Object.values(guardedNodes).reduce((total, node) => total + (node.quarantined_lease_count ?? 0), 0);
   const enabled = nodes.filter((node) => node.enabled).length;
 
   return (
@@ -159,13 +163,31 @@ export function QualityGuardPage() {
         )}
       />
 
+      <Tabs defaultValue="nodes">
+        <TabsList>
+          <TabsTrigger value="nodes">{t("qualityGuard.nodesTab")}</TabsTrigger>
+          <TabsTrigger value="profiles">{t("qualityGuard.profilesTab")}</TabsTrigger>
+          <TabsTrigger value="accounts">{t("qualityGuard.degrade.tab")}</TabsTrigger>
+        </TabsList>
+        <TabsContent value="profiles" className="mt-6">
+          <ProbeProfilesPanel />
+        </TabsContent>
+        <TabsContent value="accounts" className="mt-6">
+          <DegradeAccountsPanel
+            softTPS={status?.config?.soft_tps}
+            hardTPS={status?.config?.hard_tps}
+            failClosed={status?.config?.fail_closed}
+            minGenMs={status?.config?.min_generation_ms}
+          />
+        </TabsContent>
+        <TabsContent value="nodes" className="mt-6 space-y-6">
       {!status?.available ? <UnavailableState /> : (
         <>
           <section className="grid overflow-hidden rounded-lg bg-card sm:grid-cols-2 xl:grid-cols-4" aria-label={t("qualityGuard.overview")}>
             <Metric icon={fresh ? ShieldCheck : ShieldX} label={t("qualityGuard.serviceStatus")} value={fresh ? t("qualityGuard.running") : t("qualityGuard.stale")} tone={fresh ? "good" : "bad"} />
             <Metric icon={Activity} label={t("qualityGuard.mode")} value={t(`qualityGuard.modes.${status.config?.mode ?? "hybrid"}`)} />
             <Metric icon={Gauge} label={t("qualityGuard.availableNodes")} value={`${enabled} / ${nodes.length}`} />
-            <Metric icon={TimerReset} label={t("qualityGuard.quarantinedNodes")} value={String(quarantined)} tone={quarantined ? "bad" : "good"} />
+            <Metric icon={TimerReset} label={t("qualityGuard.quarantinedTargets")} value={String(quarantined + quarantinedLeases)} tone={quarantined || quarantinedLeases ? "bad" : "good"} />
           </section>
 
           {status.statistics ? <StatisticsPanel statistics={status.statistics} locale={i18n.language} /> : null}
@@ -224,6 +246,8 @@ export function QualityGuardPage() {
           </AlertDialog>
         </>
       )}
+        </TabsContent>
+      </Tabs>
     </div>
   );
 }
@@ -238,7 +262,7 @@ function StatisticsPanel({ statistics, locale }: { statistics: QualityGuardStati
     { icon: Eye, label: t("qualityGuard.statisticsPassive"), value: formatCount(statistics.passive.total, locale), detail: t("qualityGuard.statisticsPassiveDetail", { healthy: formatCount(statistics.passive.healthy, locale) }) },
     { icon: Coins, label: t("qualityGuard.statisticsTokens"), value: formatCount(statistics.active.output_tokens, locale), detail: t("qualityGuard.statisticsTokensHelp") },
     { icon: AlertTriangle, label: t("qualityGuard.statisticsAnomalies"), value: formatCount(anomalies, locale), detail: t("qualityGuard.statisticsAnomalyDetail", { soft: formatCount(statistics.active.soft + statistics.passive.soft, locale), hard: formatCount(statistics.active.hard + statistics.passive.hard, locale) }) },
-    { icon: Shield, label: t("qualityGuard.statisticsQuarantines"), value: formatCount(statistics.actions.quarantined, locale), detail: t("qualityGuard.statisticsActionDetail", { restored: formatCount(statistics.actions.restored, locale), suppressed: formatCount(statistics.actions.suppressed, locale) }) },
+    { icon: Shield, label: t("qualityGuard.statisticsQuarantines"), value: formatCount(statistics.actions.quarantined, locale), detail: t("qualityGuard.statisticsSuppressedActionDetail", { restored: formatCount(statistics.actions.restored, locale), suppressed: formatCount(statistics.actions.suppressed, locale) }) },
   ];
   return <section className="overflow-hidden rounded-lg bg-card" aria-labelledby="guard-statistics-title">
     <div className="px-4 py-4 sm:px-5">
@@ -354,6 +378,9 @@ function StateBadge({ node, state, protectedNode }: { node: EgressNodeDTO; state
   if (state?.disabled_by_guard) return <Badge variant="destructive">{t("qualityGuard.quarantined")}</Badge>;
   if (protectedNode) return <Badge variant="secondary">{t("qualityGuard.fixedFallback")}</Badge>;
   if (!node.enabled) return <Badge variant="secondary">{t("common.disabled")}</Badge>;
+  if (state?.quarantined_lease_count) return <Badge variant="outline" className="border-amber-500/40 text-amber-700 dark:text-amber-400" title={t("qualityGuard.leaseScopedHelp")}>{t("qualityGuard.leaseQuarantined", { count: state.quarantined_lease_count })}</Badge>;
+  if (state?.observe_only) return <Badge variant="outline" className="border-sky-500/40 text-sky-700 dark:text-sky-400" title={t("qualityGuard.leaseScopedObserveOnlyHelp")}>{t("qualityGuard.leaseScopedObserveOnly")}</Badge>;
+  if (node.accountBoundProxy) return <Badge variant="outline" className="border-sky-500/40 text-sky-700 dark:text-sky-400" title={t("qualityGuard.leaseScopedHelp")}>{t("qualityGuard.leaseScoped")}</Badge>;
   if (state?.error_strikes) return <Badge variant="outline" className="border-amber-500/40 text-amber-700 dark:text-amber-400">{t("qualityGuard.probeFailed")}</Badge>;
   if (state?.last_classification === "hard" || state?.last_classification === "soft") return <Badge variant="outline" className="border-amber-500/40 text-amber-700 dark:text-amber-400">{t("qualityGuard.suspect")}</Badge>;
   if (state?.last_classification === "healthy") return <Badge variant="outline" className="border-emerald-500/40 text-emerald-700 dark:text-emerald-400">{t("qualityGuard.healthy")}</Badge>;
@@ -366,11 +393,27 @@ function EventList({ events, locale }: { events: QualityGuardEvent[]; locale: st
     <h2 id="guard-events-title" className="text-sm font-medium">{t("qualityGuard.events")}</h2>
     {events.length === 0 ? <p className="mt-8 text-center text-xs text-muted-foreground">{t("qualityGuard.noEvents")}</p> : <div className="mt-3 space-y-1">
       {[...events].reverse().slice(0, 10).map((event, index) => <div key={`${event.ts}-${index}`} className="grid grid-cols-[minmax(0,1fr)_auto] gap-4 rounded-md px-2 py-2 hover:bg-secondary/40">
-        <div className="min-w-0"><p className="truncate text-xs font-medium">{event.node_name || `ID ${event.node_id}`} · {t(`qualityGuard.eventTypes.${event.event}`)}</p><p className="mt-1 truncate text-[11px] text-muted-foreground">{t(`qualityGuard.reasons.${event.reason || "unknown"}`)}{event.output_tps ? ` · ${formatTPS(event.output_tps)}` : ""}</p></div>
+        <div className="min-w-0"><p className="truncate text-xs font-medium">{event.node_name || `ID ${event.node_id}`} · {t(eventLabelKey(event.event))}</p><p className="mt-1 truncate text-[11px] text-muted-foreground">{t(reasonLabelKey(event.reason))}{event.account_id ? ` · ${t("qualityGuard.accountLease", { id: event.account_id })}` : ""}{event.request_id ? ` · ${event.request_id}` : ""}{event.cooldown_until ? ` · ${t("qualityGuard.leaseUntil", { time: formatTime(event.cooldown_until, locale) })}` : ""}{event.output_tps ? ` · ${formatTPS(event.output_tps)}` : ""}</p></div>
         <time className="text-[11px] text-muted-foreground">{formatTime(event.ts, locale)}</time>
       </div>)}
     </div>}
   </section>;
+}
+
+function eventLabelKey(event: string): string {
+  if (event === "lease_scoped_quarantine_suppressed") return "qualityGuard.leaseScopedQuarantineSuppressedEvent";
+  if (event === "lease_scoped_guard_released") return "qualityGuard.leaseScopedGuardReleasedEvent";
+  if (event === "lease_quarantined") return "qualityGuard.leaseQuarantinedEvent";
+  if (event === "lease_restored") return "qualityGuard.leaseRestoredEvent";
+  if (event === "lease_quarantine_extended") return "qualityGuard.leaseQuarantineExtendedEvent";
+  if (event === "lease_quarantine_failed" || event === "lease_quarantine_suppressed") return "qualityGuard.leaseQuarantineFailedEvent";
+  return `qualityGuard.eventTypes.${event}`;
+}
+
+function reasonLabelKey(reason: string): string {
+  if (reason === "lease_scoped_node") return "qualityGuard.leaseScopedNodeReason";
+  if (reason === "fixed_fallback_node") return "qualityGuard.fixedFallback";
+  return `qualityGuard.reasons.${reason || "unknown"}`;
 }
 
 function Policy({ status, onEdit }: { status: QualityGuardStatus; onEdit: () => void }) {
@@ -496,14 +539,23 @@ function isFresh(status?: QualityGuardStatus): boolean {
 function qualityTestState(result: QualityTestResult, status: QualityGuardStatus): QualityGuardNodeState {
   const softTPS = status.config?.soft_tps ?? 500;
   const hardTPS = status.config?.hard_tps ?? 1000;
+  const profile = status.profiles?.find((item) => item.id === status.activeProfileId);
+  const hasExpected = profile?.has_expected ?? true;
+  const requireThinking = result.thinkingRequired;
+  const failClosed = status.config?.fail_closed ?? false;
+  const minimumGenerationMS = status.config?.min_generation_ms ?? 0;
   let classification = "healthy";
   let reason = "within_threshold";
-  if (!result.expectedMatched) { classification = "soft"; reason = "expected_marker_missing"; }
+  if (hasExpected && !result.expectedMatched) { classification = "hard"; reason = "expected_marker_missing"; }
   else if (result.outputTokens < 32) { classification = "soft"; reason = "insufficient_output_tokens"; }
+  else if (requireThinking && result.outputTokens >= 64 && result.reasoningTokens <= 0) { classification = "hard"; reason = "missing_thinking"; }
+  else if (failClosed && result.generationMs < minimumGenerationMS && result.outputTokensPerSecond >= softTPS) { classification = "hard"; reason = "buffered_burst"; }
+  else if (failClosed && result.generationMs < minimumGenerationMS) { classification = "soft"; reason = "insufficient_generation_window"; }
   else if (result.outputTokensPerSecond >= hardTPS) { classification = "hard"; reason = "hard_tps"; }
   else if (result.outputTokensPerSecond >= softTPS) { classification = "soft"; reason = "soft_tps"; }
   const now = Date.now() / 1000;
   return {
+    observe_only: false, observe_only_reason: "", quarantined_lease_count: 0,
     active_soft_strikes: classification === "soft" ? 1 : classification === "hard" ? (status.config?.consecutive_soft ?? 2) : 0,
     passive_soft_strikes: 0, error_strikes: 0, quarantined_until: 0, disabled_by_guard: false,
     last_reason: reason, last_probe_at: now, last_observed_at: now, last_source: "active",

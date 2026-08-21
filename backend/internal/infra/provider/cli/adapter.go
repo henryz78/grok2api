@@ -39,11 +39,14 @@ type Config struct {
 	TokenAuth             string
 	UserAgent             string
 	ResponseHeaderTimeout time.Duration
+	StreamIdleTimeout     time.Duration
 }
 
 const (
 	subscriptionTierTimeout = 10 * time.Second
 	buildControlTimeout     = 30 * time.Second
+	buildGrok45Model        = "grok-4.5"
+	buildGrok46Model        = "grok-4.6"
 )
 
 // Adapter implements the Grok Build CLI Responses, model, Billing, and OAuth protocols.
@@ -66,6 +69,7 @@ type Adapter struct {
 
 func NewAdapter(cfg Config, cipher *security.Cipher) *Adapter {
 	cfg.ResponseHeaderTimeout = normalizeBuildResponseHeaderTimeout(cfg.ResponseHeaderTimeout)
+	cfg.StreamIdleTimeout = normalizeBuildStreamIdleTimeout(cfg.StreamIdleTimeout)
 	transport := newBuildDirectTransport(cfg.ResponseHeaderTimeout)
 	httpClient := &http.Client{Transport: transport}
 	// The official CLI uses a persistent machine identity. The gateway does not collect machine fingerprints;
@@ -99,7 +103,8 @@ func (a *Adapter) SetReasoningReplay(replay *reasoningreplay.ReasoningReplay) {
 func (a *Adapter) Provider() account.Provider { return account.ProviderBuild }
 
 // CredentialMetadata extracts only non-sensitive risk flags from a Build access token.
-// bot_flag_source must be JSON number 1; other values, malformed tokens, and decryption failures are not marked.
+// bot_flag_source or its short alias bfs must be JSON number 1 or 2; other values, malformed
+// tokens, and decryption failures are not marked. bot_flag_source is preferred when both are set.
 func (a *Adapter) CredentialMetadata(credential account.Credential) provider.CredentialMetadata {
 	if credential.Provider != account.ProviderBuild || a.cipher == nil || credential.EncryptedAccessToken == "" {
 		return provider.CredentialMetadata{}
@@ -108,12 +113,52 @@ func (a *Adapter) CredentialMetadata(credential account.Credential) provider.Cre
 	if err != nil {
 		return provider.CredentialMetadata{}
 	}
-	value, ok := decodeJWTClaims(accessToken)["bot_flag_source"].(float64)
-	return provider.CredentialMetadata{BuildBotFlagged: ok && value == 1}
+	claims := decodeJWTClaims(accessToken)
+	if claims == nil {
+		return provider.CredentialMetadata{}
+	}
+	source := buildBotFlagSourceFromClaims(claims)
+	return provider.CredentialMetadata{
+		BuildBotFlagInspected: true,
+		BuildBotFlagged:       source != 0,
+		BuildBotFlagSource:    source,
+	}
+}
+
+// buildBotFlagSourceFromClaims returns the bot-risk source from JWT claims.
+// Accepts bot_flag_source or bfs; only JSON numbers 1 and 2 count (string "1"/"2" do not).
+// Prefer bot_flag_source when it is 1 or 2; otherwise fall back to bfs.
+func buildBotFlagSourceFromClaims(claims map[string]any) int {
+	if claims == nil {
+		return 0
+	}
+	if source := botFlagSourceClaim(claims, "bot_flag_source"); source != 0 {
+		return source
+	}
+	return botFlagSourceClaim(claims, "bfs")
+}
+
+func botFlagSourceClaim(claims map[string]any, key string) int {
+	value, ok := claims[key].(float64)
+	if !ok {
+		return 0
+	}
+	switch value {
+	case 1, 2:
+		return int(value)
+	default:
+		return 0
+	}
+}
+
+// buildBotFlaggedFromClaims reports whether JWT claims mark a Build account as bot-risked.
+func buildBotFlaggedFromClaims(claims map[string]any) bool {
+	return buildBotFlagSourceFromClaims(claims) != 0
 }
 
 func (a *Adapter) UpdateConfig(cfg Config) {
 	cfg.ResponseHeaderTimeout = normalizeBuildResponseHeaderTimeout(cfg.ResponseHeaderTimeout)
+	cfg.StreamIdleTimeout = normalizeBuildStreamIdleTimeout(cfg.StreamIdleTimeout)
 	a.cfgMu.Lock()
 	previousTimeout := a.cfg.ResponseHeaderTimeout
 	a.cfg = cfg
@@ -162,6 +207,13 @@ func normalizeBuildResponseHeaderTimeout(value time.Duration) time.Duration {
 	return value
 }
 
+func normalizeBuildStreamIdleTimeout(value time.Duration) time.Duration {
+	if value <= 0 {
+		return settingsdomain.DefaultBuildStreamIdleTimeout
+	}
+	return value
+}
+
 func (a *Adapter) config() Config {
 	a.cfgMu.RLock()
 	defer a.cfgMu.RUnlock()
@@ -169,6 +221,9 @@ func (a *Adapter) config() Config {
 }
 
 func (a *Adapter) ForwardResponse(ctx context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
+	if request.NormalizedMetadata != nil {
+		*request.NormalizedMetadata = provider.NormalizedRequestMetadata{}
+	}
 	accessToken, err := a.cipher.Decrypt(request.Credential.EncryptedAccessToken)
 	if err != nil {
 		return nil, err
@@ -181,17 +236,23 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	if request.NormalizeBody {
 		if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
 			body, conversationOptions, err = conversation.ConvertRequestWithOptions(body, request.Model, request.Operation)
+			if err == nil && conversationOptions.ReasoningEffortSet && request.NormalizedMetadata != nil {
+				request.NormalizedMetadata.ReasoningEffort = conversationOptions.ReasoningEffort
+			}
 		} else {
-			var foreignCompactions int
-			body, foreignCompactions, err = expandGatewayCompactionHistory(body, a.compaction, request.PromptCacheKey)
+			var foreignCompactions, driftedCompactions int
+			body, foreignCompactions, driftedCompactions, err = expandGatewayCompactionHistory(body, a.compaction, request.PromptCacheKey)
 			if err != nil {
 				return invalidResponsesResponse(err), nil
 			}
-			body, toolCompatibility, err = normalizeResponsesRequest(body, request.Model)
+			body, toolCompatibility, err = normalizeResponsesRequestWithMetadata(body, request.Model, request.NormalizedMetadata)
 			if toolCompatibility != nil {
 				compactionRequested = toolCompatibility.compactionRequested
 				if foreignCompactions > 0 {
 					toolCompatibility.addWarning("foreign_compaction_omitted")
+				}
+				if driftedCompactions > 0 {
+					toolCompatibility.addWarning("compaction_session_drifted")
 				}
 			}
 		}
@@ -201,7 +262,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			}
 			return invalidResponsesResponse(err), nil
 		}
-		body, err = normalizeBuildRequest(body, request.Model)
+		body, err = normalizeBuildRequestWithMetadata(body, request.Model, request.Operation, request.NormalizedMetadata)
 		if err != nil {
 			if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
 				return invalidConversationResponse(request.Operation, err), nil
@@ -246,7 +307,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		}
 		return a.forwardGatewayCompaction(ctx, request, accessToken, body, warnings)
 	}
-	// Explicit mode wins; in auto mode only confirmed Super accounts with bot_flag_source=1 default to XAI.
+	// Explicit mode wins; in auto mode only confirmed Super accounts with bot_flag_source/bfs in {1,2} default to XAI.
 	primaryBase := a.primaryBaseURL()
 	base := a.inferenceBaseForOperation(request.Credential, request.Billing, request.Method, request.Path)
 	// Cache affinity and reasoning replay use separate identities. Replay is also bound to the actual account and upstream plane,
@@ -321,6 +382,9 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 				Body: append([]byte(nil), body...), BodyTruncated: true,
 			}
 		}
+	}
+	if request.Streaming && isHTTPSuccess(resp.StatusCode) && resp.Body != nil {
+		resp.Body = wrapBuildSemanticIdle(resp.Body, a.config().StreamIdleTimeout)
 	}
 	modelCatalogChanged := a.modelCatalogChanged(request.Credential.ID, resp.Header.Get("x-models-etag"))
 	// Capture or clear reasoning replay in the upstream Responses shape before protocol conversion.
@@ -578,15 +642,17 @@ func (a *Adapter) ListModels(ctx context.Context, credential account.Credential)
 
 // NormalizeAccountModelCapabilities normalizes capabilities that the OAuth
 // session contract exposes independently of the account's sparse /models list.
-// Composer is available to Build OAuth sessions even though the live catalog can
-// return only grok-4.5. Super always includes video 1.5; Free and Unknown remove
-// video 1.5 exactly. BuildAPIFallback is ignored.
+// Composer is available to Build OAuth sessions independently of the sparse
+// live catalog. Grok 4.6 sessions retain the still-supported Grok 4.5 route for
+// backwards compatibility. Super always includes video 1.5; Free and Unknown
+// remove video 1.5 exactly. BuildAPIFallback is ignored.
 func (a *Adapter) NormalizeAccountModelCapabilities(models []string, billing *account.Billing, credential account.Credential) []string {
 	super := account.IsBuildSuper(credential, billing)
 	composer := credential.Provider == account.ProviderBuild && credential.AuthType == account.AuthTypeOAuth
 	result := make([]string, 0, len(models)+2)
 	seen := make(map[string]struct{}, len(models)+2)
 	hasVideo15 := false
+	hasGrok46 := false
 	for _, model := range models {
 		model = strings.TrimSpace(model)
 		if model == "" {
@@ -601,8 +667,17 @@ func (a *Adapter) NormalizeAccountModelCapabilities(models []string, billing *ac
 			}
 			hasVideo15 = true
 		}
+		if model == buildGrok46Model {
+			hasGrok46 = true
+		}
 		seen[model] = struct{}{}
 		result = append(result, model)
+	}
+	if credential.Provider == account.ProviderBuild && hasGrok46 {
+		if _, exists := seen[buildGrok45Model]; !exists {
+			seen[buildGrok45Model] = struct{}{}
+			result = append(result, buildGrok45Model)
+		}
 	}
 	if super && !hasVideo15 {
 		result = append(result, buildVideoModel)
@@ -758,7 +833,7 @@ func (a *Adapter) RefreshCredential(ctx context.Context, credential account.Cred
 		return provider.RefreshedCredential{}, &provider.CredentialRefreshError{Code: "missing_refresh_token", Message: "Refresh token is missing", Permanent: true}
 	}
 	refreshCtx := infraegress.WithCredential(ctx, credential)
-	tokens, err := a.oauth.refresh(refreshCtx, refreshToken)
+	tokens, err := a.oauth.refreshWithClientID(refreshCtx, refreshToken, credential.OIDCClientID)
 	if err != nil {
 		return provider.RefreshedCredential{}, err
 	}
@@ -770,7 +845,7 @@ func (a *Adapter) RefreshCredential(ctx context.Context, credential account.Cred
 	if err != nil {
 		return provider.RefreshedCredential{}, err
 	}
-	return provider.RefreshedCredential{EncryptedAccessToken: accessEncrypted, EncryptedRefreshToken: refreshEncrypted, ExpiresAt: tokens.ExpiresAt}, nil
+	return provider.RefreshedCredential{EncryptedAccessToken: accessEncrypted, EncryptedRefreshToken: refreshEncrypted, ExpiresAt: tokens.ExpiresAt, RefreshTokenRotated: tokens.RefreshTokenRotated}, nil
 }
 
 func (a *Adapter) StartDeviceAuthorization(ctx context.Context) (provider.DeviceAuthorization, error) {
@@ -794,6 +869,34 @@ func (a *Adapter) PollDeviceAuthorization(ctx context.Context, deviceCode string
 
 func (a *Adapter) ParseImportedCredentials(data []byte) ([]provider.CredentialSeed, error) {
 	return parseImportedCredentials(data)
+}
+
+// PrepareImportedCredential validates a refresh-token-only import and keeps
+// the rotated tokens returned by xAI before the account is persisted.
+func (a *Adapter) PrepareImportedCredential(ctx context.Context, seed provider.CredentialSeed) (provider.CredentialSeed, error) {
+	if strings.TrimSpace(seed.AccessToken) != "" || strings.TrimSpace(seed.RefreshToken) == "" {
+		return seed, nil
+	}
+	refreshCtx, cancel := context.WithTimeout(ctx, buildControlTimeout)
+	defer cancel()
+	tokens, err := a.oauth.refreshWithClientID(refreshCtx, strings.TrimSpace(seed.RefreshToken), seed.OIDCClientID)
+	if err != nil {
+		return provider.CredentialSeed{}, fmt.Errorf("验证 Grok Build refresh token: %w", err)
+	}
+	claims := decodeJWTClaims(firstNonEmpty(tokens.IDToken, tokens.AccessToken))
+	seed.AccessToken = tokens.AccessToken
+	seed.RefreshToken = tokens.RefreshToken
+	seed.ExpiresAt = tokens.ExpiresAt
+	seed.OIDCClientID = firstNonEmpty(seed.OIDCClientID, defaultOAuthClientID)
+	seed.UserID = firstNonEmpty(seed.UserID, stringClaim(claims, "sub"))
+	seed.Email = firstNonEmpty(seed.Email, stringClaim(claims, "email"))
+	seed.TeamID = firstNonEmpty(seed.TeamID, stringClaim(claims, "team_id"))
+	if seed.Name == "" || seed.Name == "Grok Build account" {
+		seed.Name = firstNonEmpty(seed.Email, seed.UserID, "Grok Build account")
+	}
+	identity := firstNonEmpty(seed.UserID, strings.ToLower(seed.Email), seed.TeamID, seed.RefreshToken, seed.AccessToken)
+	seed.SourceKey = "import:" + security.HashToken(strings.Join([]string{credentialImportProvider, seed.OIDCClientID, identity}, "|"))
+	return seed, nil
 }
 
 func (a *Adapter) MarshalCredentials(values []provider.CredentialSeed) ([]byte, error) {

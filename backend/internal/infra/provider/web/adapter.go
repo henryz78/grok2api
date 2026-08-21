@@ -7,6 +7,7 @@ import (
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
+	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
@@ -14,16 +15,17 @@ import (
 )
 
 type Config struct {
-	BaseURL             string
-	StatsigMode         string
-	StatsigManualValue  string
-	StatsigSignerURL    string
-	QuotaTimeoutSeconds int
-	ChatTimeoutSeconds  int
-	ImageTimeoutSeconds int
-	VideoTimeoutSeconds int
-	MaxInputImageBytes  int64
-	AllowNSFW           bool
+	BaseURL                  string
+	StatsigMode              string
+	StatsigManualValue       string
+	StatsigSignerURL         string
+	QuotaTimeoutSeconds      int
+	ChatTimeoutSeconds       int
+	StreamIdleTimeoutSeconds int
+	ImageTimeoutSeconds      int
+	VideoTimeoutSeconds      int
+	MaxInputImageBytes       int64
+	AllowNSFW                bool
 }
 
 type Adapter struct {
@@ -72,6 +74,9 @@ func normalizedConfig(cfg Config) Config {
 	if cfg.ChatTimeoutSeconds <= 0 {
 		cfg.ChatTimeoutSeconds = 120
 	}
+	if cfg.StreamIdleTimeoutSeconds <= 0 {
+		cfg.StreamIdleTimeoutSeconds = int(settingsdomain.DefaultWebStreamIdleTimeout.Seconds())
+	}
 	if cfg.ImageTimeoutSeconds <= 0 {
 		cfg.ImageTimeoutSeconds = 180
 	}
@@ -110,6 +115,13 @@ func (a *Adapter) QuotaMode(upstreamModel string) string {
 	return ""
 }
 
+func (a *Adapter) QuotaRefreshGroup(upstreamModel string) string {
+	if spec, ok := Resolve(upstreamModel); ok && account.IsWebImagineQuotaMode(spec.Mode) {
+		return account.QuotaGroupWebImagine
+	}
+	return ""
+}
+
 func (a *Adapter) TierOrder(upstreamModel string) []account.WebTier {
 	spec, ok := Resolve(upstreamModel)
 	if !ok {
@@ -125,11 +137,42 @@ func (a *Adapter) TierOrder(upstreamModel string) []account.WebTier {
 	}
 }
 
+func (a *Adapter) TierOrderForQuotaMode(upstreamModel, quotaMode string) []account.WebTier {
+	order := a.TierOrder(upstreamModel)
+	spec, ok := Resolve(upstreamModel)
+	if !ok || spec.Capability != modeldomain.CapabilityVideo || quotaMode == account.QuotaModeWebVideo720p {
+		return order
+	}
+	// Basic video entitlement is currently confirmed only for the default
+	// 720p product. Other video quota products remain on paid Web tiers until
+	// independently verified upstream.
+	filtered := make([]account.WebTier, 0, len(order))
+	for _, tier := range order {
+		if tier != account.WebTierBasic {
+			filtered = append(filtered, tier)
+		}
+	}
+	return filtered
+}
+
 func (a *Adapter) PricingModel(upstreamModel string) string {
 	spec, ok := Resolve(upstreamModel)
 	if ok {
 		if spec.Capability == modeldomain.CapabilityChat {
 			return "grok-4.5"
+		}
+		// Lite keeps its historical upstream billing name; Imagine WebSocket
+		// models use their canonical public product name rather than the internal
+		// compatibility identifier used to preserve route IDs.
+		if spec.Capability == modeldomain.CapabilityImage {
+			if spec.ProtocolModel == "imagine" {
+				return spec.PublicID
+			}
+			return spec.UpstreamModel
+		}
+		// Dedicated Web edit upstream keeps a stable billing name.
+		if spec.Capability == modeldomain.CapabilityImageEdit {
+			return "grok-imagine-image-edit"
 		}
 		return spec.PublicID
 	}
