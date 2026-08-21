@@ -13,6 +13,22 @@ import (
 var ErrSubscriptionSync = errors.New("代理订阅同步失败")
 
 func (s *Service) syncSource(ctx context.Context, operations OperationsRepository, source domain.SubscriptionSource) (ImportResult, error) {
+	// Keep legacy per-source proxies working for sources created before the
+	// global operations proxy was introduced. New sources use the global config.
+	if strings.TrimSpace(source.EncryptedProxyURL) != "" {
+		return s.syncSourceWithConfig(ctx, operations, source, domain.OperationsConfig{})
+	}
+	config, err := operations.GetEgressOperationsConfig(ctx)
+	if err != nil {
+		now := time.Now().UTC()
+		nextSyncAt := sourceNextSyncAt(source, now)
+		_ = operations.UpdateEgressSourceSync(context.WithoutCancel(ctx), source.ID, now, nextSyncAt, 0, "订阅拉取或解析失败")
+		return ImportResult{}, ErrSubscriptionSync
+	}
+	return s.syncSourceWithConfig(ctx, operations, source, config)
+}
+
+func (s *Service) syncSourceWithConfig(ctx context.Context, operations OperationsRepository, source domain.SubscriptionSource, config domain.OperationsConfig) (ImportResult, error) {
 	now := time.Now().UTC()
 	nextSyncAt := sourceNextSyncAt(source, now)
 	recordFailure := func() {
@@ -29,10 +45,17 @@ func (s *Service) syncSource(ctx context.Context, operations OperationsRepositor
 		recordFailure()
 		return ImportResult{}, ErrSubscriptionSync
 	}
-	fetchProxy, err := s.subscriptionFetchProxy(source)
+	fetchProxy, err := s.subscriptionFetchProxy(config)
 	if err != nil {
 		recordFailure()
 		return ImportResult{}, ErrSubscriptionSync
+	}
+	if fetchProxy == "" {
+		fetchProxy, err = s.subscriptionFetchProxy(source)
+		if err != nil {
+			recordFailure()
+			return ImportResult{}, ErrSubscriptionSync
+		}
 	}
 	content, err := fetchProxySubscription(ctx, urlValue, fetchProxy)
 	if err != nil {
@@ -82,8 +105,17 @@ func sourceNextSyncAt(source domain.SubscriptionSource, now time.Time) time.Time
 	return now.Add(time.Duration(source.RefreshIntervalSeconds) * time.Second)
 }
 
-func (s *Service) subscriptionFetchProxy(source domain.SubscriptionSource) (string, error) {
-	encrypted := strings.TrimSpace(source.EncryptedProxyURL)
+func (s *Service) subscriptionFetchProxy(value any) (string, error) {
+	var encrypted string
+	switch value := value.(type) {
+	case domain.OperationsConfig:
+		encrypted = value.EncryptedSubscriptionProxyURL
+	case domain.SubscriptionSource:
+		encrypted = value.EncryptedProxyURL
+	default:
+		return "", errors.New("订阅拉取代理配置类型无效")
+	}
+	encrypted = strings.TrimSpace(encrypted)
 	if encrypted == "" {
 		return "", nil
 	}

@@ -98,6 +98,11 @@ export type EgressSourceInput = {
 export type EgressOperationsConfigDTO = {
   probeProvider: "ipinfo" | "cloudflare"; probeIntervalSeconds: number; autoAssignEnabled: boolean; autoBalanceEnabled: boolean;
   assignmentIntervalSeconds: number; fallbacks: Record<EgressScope, EgressFallbackConfigDTO>; updatedAt: string;
+  subscriptionProxyConfigured: boolean;
+};
+export type EgressOperationsConfigInput = Omit<EgressOperationsConfigDTO, "updatedAt" | "subscriptionProxyConfigured"> & {
+  subscriptionProxyURL?: string;
+  clearSubscriptionProxy?: boolean;
 };
 export type EgressImportResultDTO = { imported: number; skipped: number };
 export type EgressIPProbeDTO = { status: "unknown" | "healthy" | "unhealthy"; testedAt?: string; latencyMs: number; exitIp?: string; error?: string };
@@ -318,10 +323,11 @@ const egressFallbackConfigValidator = hasShape({ mode: isOneOf("none", "direct",
 const decodeEgressOperationsConfigRaw = createObjectDecoder<EgressOperationsConfigWireDTO>("egress operations config", {
   probeProvider: isOptional(isOneOf("ipinfo", "cloudflare")), probeIntervalSeconds: isNumber, autoAssignEnabled: isBoolean, autoBalanceEnabled: isBoolean, assignmentIntervalSeconds: isNumber,
   fallbacks: isRecordOf(egressFallbackConfigValidator), updatedAt: isString,
+  subscriptionProxyConfigured: isOptional(isBoolean),
 });
 const decodeEgressOperationsConfig = (value: unknown): EgressOperationsConfigDTO => {
   const decoded = decodeEgressOperationsConfigRaw(value);
-  return { ...decoded, probeProvider: decoded.probeProvider ?? "cloudflare" };
+  return { ...decoded, probeProvider: decoded.probeProvider ?? "cloudflare", subscriptionProxyConfigured: decoded.subscriptionProxyConfigured ?? false };
 };
 const decodeEgressProbeResultRaw = createObjectDecoder<EgressProbeResultWireDTO>("egress probe", {
   status: isOneOf("unknown", "healthy", "unhealthy"), testedAt: isString, latencyMs: isNumber, exitIp: isOptional(isString), error: isOptional(isString), probeProvider: isOptional(isOneOf("ipinfo", "cloudflare")),
@@ -489,7 +495,7 @@ export function getEgressOperationsConfig(): Promise<EgressOperationsConfigDTO> 
   return apiRequest("/api/admin/v1/egress-operations", {}, decodeEgressOperationsConfig);
 }
 
-export function updateEgressOperationsConfig(input: Omit<EgressOperationsConfigDTO, "updatedAt">): Promise<EgressOperationsConfigDTO> {
+export function updateEgressOperationsConfig(input: EgressOperationsConfigInput): Promise<EgressOperationsConfigDTO> {
   return apiRequest("/api/admin/v1/egress-operations", { method: "PUT", body: input }, decodeEgressOperationsConfig);
 }
 
