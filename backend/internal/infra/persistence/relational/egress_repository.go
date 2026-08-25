@@ -523,9 +523,6 @@ func (r *EgressRepository) SaveEgressOperationsConfig(ctx context.Context, value
 		// migration cannot run again and overwrite an intentionally direct source.
 		row.SubscriptionProxyMigrationCompleted = locked.SubscriptionProxyMigrationCompleted
 		row.ProxyProfileMigrationCompleted = locked.ProxyProfileMigrationCompleted
-		if !value.ClearSubscriptionProxy && row.EncryptedSubscriptionProxyURL == "" && locked.EncryptedSubscriptionProxyURL != "" {
-			row.EncryptedSubscriptionProxyURL = locked.EncryptedSubscriptionProxyURL
-		}
 		if err := validateLockedEgressFallbackNodes(tx, row); err != nil {
 			return err
 		}
@@ -932,8 +929,7 @@ func toEgressOperationsConfigDomain(row egressOperationsConfigModel) egress.Oper
 	return egress.OperationsConfig{
 		ProbeProvider:        egress.ProbeProvider(row.ProbeProvider).Normalized(),
 		ProbeIntervalSeconds: row.ProbeIntervalSeconds, AutoAssignEnabled: row.AutoAssignEnabled, AutoBalanceEnabled: row.AutoBalanceEnabled,
-		AssignmentIntervalSeconds:         row.AssignmentIntervalSeconds,
-		EncryptedSubscriptionProxyURL:     row.EncryptedSubscriptionProxyURL,
+		AssignmentIntervalSeconds: row.AssignmentIntervalSeconds,
 		Fallbacks: map[egress.Scope]egress.FallbackConfig{
 			egress.ScopeBuild:        {Mode: egress.FallbackMode(row.BuildFallbackMode).Normalized(), NodeID: row.BuildFallbackNodeID},
 			egress.ScopeWeb:          {Mode: egress.FallbackMode(row.WebFallbackMode).Normalized(), NodeID: row.WebFallbackNodeID},
@@ -954,8 +950,7 @@ func fromEgressOperationsConfigDomain(value egress.OperationsConfig) egressOpera
 	return egressOperationsConfigModel{
 		ID: 1, ProbeProvider: string(value.ProbeProvider.Normalized()), ProbeIntervalSeconds: value.ProbeIntervalSeconds, AutoAssignEnabled: value.AutoAssignEnabled,
 		AutoBalanceEnabled: value.AutoBalanceEnabled, AssignmentIntervalSeconds: value.AssignmentIntervalSeconds,
-		EncryptedSubscriptionProxyURL: value.EncryptedSubscriptionProxyURL,
-		BuildFallbackMode:             string(buildFallback.Mode), BuildFallbackNodeID: buildFallback.NodeID,
+		BuildFallbackMode: string(buildFallback.Mode), BuildFallbackNodeID: buildFallback.NodeID,
 		WebFallbackMode: string(webFallback.Mode), WebFallbackNodeID: webFallback.NodeID,
 		ConsoleFallbackMode: string(consoleFallback.Mode), ConsoleFallbackNodeID: consoleFallback.NodeID,
 		WebAssetFallbackMode: string(webAssetFallback.Mode), WebAssetFallbackNodeID: webAssetFallback.NodeID,

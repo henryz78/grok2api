@@ -572,7 +572,6 @@ type egressOperationsConfigModel struct {
 	AutoAssignEnabled                   bool      `gorm:"not null;default:false"`
 	AutoBalanceEnabled                  bool      `gorm:"not null;default:false"`
 	AssignmentIntervalSeconds           int       `gorm:"not null;default:300;check:chk_egress_operations_config_assignment_interval,assignment_interval_seconds BETWEEN 60 AND 86400"`
-	EncryptedSubscriptionProxyURL       string    `gorm:"type:text;not null;default:'';check:chk_egress_operations_config_subscription_proxy,length(encrypted_subscription_proxy_url) <= 65536"`
 	SubscriptionProxyMigrationCompleted bool      `gorm:"not null;default:false"`
 	ProxyProfileMigrationCompleted      bool      `gorm:"not null;default:false"`
 	BuildFallbackMode                   string    `gorm:"size:16;not null;default:none"`

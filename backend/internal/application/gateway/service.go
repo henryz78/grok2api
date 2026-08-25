@@ -1235,7 +1235,10 @@ attemptLoop:
 				err = &SelectionUnavailableError{Reason: SelectionNoAccounts}
 			} else {
 				lease, err = s.selector.AcquirePinnedForQualityProbe(ctx, route.Provider, input.ForcedAccountID, route.ID, route.UpstreamModel, quotaMode, accountScope)
-				if err == nil && lease.Credential.EgressNodeID != input.ForcedEgressNodeID {
+				// An unbound account can still have reached the observed node through
+				// runtime pool selection. The Provider request below carries the forced
+				// node explicitly; only a conflicting concrete binding is invalid.
+				if err == nil && lease.Credential.EgressNodeID != 0 && lease.Credential.EgressNodeID != input.ForcedEgressNodeID {
 					lease.Release()
 					lease = nil
 					err = &SelectionUnavailableError{Reason: SelectionNoAccounts}
@@ -1321,8 +1324,24 @@ attemptLoop:
 			if !isRetryableTransportFailure(credential.Provider, err) {
 				break
 			}
-			if !neterrorpkg.IsUpstreamStreamIdleTimeout(err) {
+			responseFailure := false
+			if status, retryAfter, classified := upstreamResponseErrorHealthPenalty(err, holdCfg.IdleAccountCooldown); classified {
+				responseFailure = true
+				writeCtx, writeCancel := context.WithTimeout(context.WithoutCancel(ctx), finalizationTimeout)
+				markErr := s.selector.MarkFailureAfterSuccess(writeCtx, credential, status, retryAfter)
+				writeCancel()
+				if markErr != nil {
+					s.logger.Warn("upstream_response_health_write_failed", "request_id", input.RequestID, "account_id", credential.ID, "error", markErr)
+				} else {
+					s.logger.Warn("upstream_response_health_retry", "request_id", input.RequestID, "account_id", credential.ID, "status", status, "minimum_cooldown", retryAfter)
+				}
+			} else {
 				s.selector.MarkFailure(ctx, credential, 0, 0)
+			}
+			// The failed response is safe to retry on another account only when
+			// doing so cannot repeat an upstream-hosted tool side effect.
+			if responseFailure && qualityRequestHasReplayUnsafeHostedTools(input.Body) {
+				break attemptLoop
 			}
 			if shouldStopForNonAccountFingerprint(failureFingerprints, lastFailure) {
 				break
@@ -1498,9 +1517,9 @@ attemptLoop:
 			}
 			failureHandled := false
 			if lease.QuotaMode != "" && response.StatusCode == http.StatusTooManyRequests {
-				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
-				s.selector.MarkQuotaStateChanged(credential.Provider, credential.ID)
-				failureHandled = reconcileErr == nil && exhausted
+				state, reconcileErr := s.accounts.ReconcileRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
+				s.applyRateLimitReconciliation(ctx, credential, response.StatusCode, retryAfter, state, reconcileErr)
+				failureHandled = true
 			} else if used, limit, exhausted := parseFreeQuotaExhaustion(body); exhausted {
 				// The Free subscription signal is account-scoped, but its billing
 				// period is not a reliable reset promise. Probe again after 24 hours.
@@ -1546,8 +1565,13 @@ attemptLoop:
 			if lastFailure.AccountScoped && !failureHandled {
 				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
 			} else if !lastFailure.AccountScoped && response.StatusCode >= http.StatusInternalServerError {
-				// 5xx 短冷却：本请求已 excluded，跨请求避免立刻再打同一坏号。
-				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+				// Provider-wide 5xx responses should rotate this request and briefly
+				// isolate the account across requests, but must not grow the durable
+				// account failure count exponentially. Preserve the real status in
+				// health diagnostics while applying the explicit soft policy.
+				if markErr := s.selector.markSoftFailure(ctx, credential, response.StatusCode, retryAfter); markErr != nil {
+					s.logger.Warn("upstream_soft_cooldown_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "error", markErr)
+				}
 			}
 			lease.Release()
 			lastErr = fmt.Errorf("上游返回 %d", response.StatusCode)
@@ -1721,7 +1745,7 @@ attemptLoop:
 
 func isUpstreamStreamFailure(errorCode string) bool {
 	switch errorCode {
-	case "upstream_stream_incomplete", "upstream_stream_interrupted", "upstream_stream_idle_timeout":
+	case "upstream_stream_incomplete", "upstream_stream_interrupted", "upstream_stream_idle_timeout", "upstream_response_empty":
 		return true
 	default:
 		return false
@@ -1729,13 +1753,37 @@ func isUpstreamStreamFailure(errorCode string) bool {
 }
 
 func streamFailureHealthPenalty(errorCode string, usage Usage, idleCooldown time.Duration) (int, time.Duration) {
-	if errorCode == "upstream_stream_idle_timeout" && !usage.OutputObserved && usage.OutputTokens == 0 && usage.ReasoningTokens == 0 {
+	if (errorCode == "upstream_stream_idle_timeout" || errorCode == "upstream_response_empty") && !usage.OutputObserved && usage.OutputTokens == 0 && usage.ReasoningTokens == 0 {
 		if idleCooldown <= 0 {
 			idleCooldown = qualityIdleAccountCooldown
+		}
+		if errorCode == "upstream_response_empty" {
+			return http.StatusBadGateway, idleCooldown
 		}
 		return http.StatusGatewayTimeout, idleCooldown
 	}
 	return 0, 0
+}
+
+// upstreamResponseErrorHealthPenalty classifies failures that happen after a
+// successful response header but before a usable non-streaming body exists.
+// A truly empty response receives the configured long cooldown. If some body
+// bytes arrived before an idle timeout, retain only the ordinary short network
+// cooldown by returning a zero status/retry pair.
+func upstreamResponseErrorHealthPenalty(err error, idleCooldown time.Duration) (int, time.Duration, bool) {
+	switch {
+	case neterrorpkg.IsUpstreamResponseEmpty(err):
+		status, cooldown := streamFailureHealthPenalty("upstream_response_empty", Usage{}, idleCooldown)
+		return status, cooldown, true
+	case neterrorpkg.IsUpstreamStreamIdleTimeout(err):
+		if neterrorpkg.IdleTimeoutObservedData(err) {
+			return 0, 0, true
+		}
+		status, cooldown := streamFailureHealthPenalty("upstream_stream_idle_timeout", Usage{}, idleCooldown)
+		return status, cooldown, true
+	default:
+		return 0, 0, false
+	}
 }
 
 // auditRequestSucceeded keeps transport truth (the HTTP status) separate from
@@ -2078,6 +2126,23 @@ func isTerminalRequestForbidden(upstreamProvider accountdomain.Provider, failure
 func forcesAccountFailover(status int, upstreamProvider accountdomain.Provider) bool {
 	return upstreamProvider == accountdomain.ProviderBuild &&
 		(status == http.StatusPaymentRequired || status == http.StatusForbidden || status == http.StatusTooManyRequests)
+}
+
+func (s *Service) applyRateLimitReconciliation(ctx context.Context, credential accountdomain.Credential, status int, retryAfter time.Duration, state accountapp.RateLimitReconcileState, reconcileErr error) {
+	s.selector.MarkQuotaStateChanged(credential.Provider, credential.ID)
+	if reconcileErr == nil && state == accountapp.RateLimitReconcileExhausted {
+		return
+	}
+	if credential.Provider == accountdomain.ProviderConsole && status == http.StatusTooManyRequests {
+		// A Console 429 with available quota, an in-progress cross-instance probe,
+		// or an inconclusive /usage request is transient. Isolate the account for
+		// this Retry-After window without growing its durable failure count.
+		if err := s.selector.markSoftFailure(ctx, credential, status, retryAfter); err != nil {
+			s.logger.Warn("console_rate_limit_soft_cooldown_failed", "account_id", credential.ID, "state", state, "error", err)
+		}
+		return
+	}
+	s.selector.MarkFailure(ctx, credential, status, retryAfter)
 }
 
 func parseRetryAfter(value string, now time.Time) time.Duration {

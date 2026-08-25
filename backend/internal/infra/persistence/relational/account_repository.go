@@ -40,7 +40,10 @@ type quotaBreakdownJSON struct {
 
 const (
 	accountUpdateBatchSize      = 500
-	accountPaidPlanSignal       = `(LOWER(REPLACE(REPLACE(REPLACE(REPLACE(TRIM(billing.plan_code), ' ', ''), '_', ''), '-', ''), '+', 'plus')) IN ('super', 'supergrok', 'supergrokpro', 'supergrokheavy', 'supergroklite', 'grokpro', 'xpremium', 'xpremiumplus', 'apikey') OR LOWER(REPLACE(REPLACE(REPLACE(REPLACE(TRIM(billing.plan_name), ' ', ''), '_', ''), '-', ''), '+', 'plus')) IN ('super', 'supergrok', 'supergrokpro', 'supergrokheavy', 'supergroklite', 'grokpro', 'xpremium', 'xpremiumplus', 'apikey'))`
+	accountNormalizedPlanCode   = `LOWER(REPLACE(REPLACE(REPLACE(REPLACE(TRIM(billing.plan_code), ' ', ''), '_', ''), '-', ''), '+', 'plus'))`
+	accountNormalizedPlanName   = `LOWER(REPLACE(REPLACE(REPLACE(REPLACE(TRIM(billing.plan_name), ' ', ''), '_', ''), '-', ''), '+', 'plus'))`
+	accountPaidPlanNames        = `'super', 'supergrok', 'supergrokpro', 'supergrokheavy', 'supergroklite', 'supergrokplus', 'grokpro', 'xpremium', 'xpremiumplus', 'apikey'`
+	accountPaidPlanSignal       = `(` + accountNormalizedPlanCode + ` IN (` + accountPaidPlanNames + `) OR ` + accountNormalizedPlanName + ` IN (` + accountPaidPlanNames + `) OR substr(` + accountNormalizedPlanCode + `, 1, 9) = 'supergrok' OR substr(` + accountNormalizedPlanName + `, 1, 9) = 'supergrok')`
 	accountFreePlanSignal       = `(LOWER(REPLACE(REPLACE(REPLACE(REPLACE(TRIM(billing.plan_code), ' ', ''), '_', ''), '-', ''), '+', 'plus')) IN ('free', 'grokfree', 'freetier', 'basic', 'grokbasic', 'xbasic') OR LOWER(REPLACE(REPLACE(REPLACE(REPLACE(TRIM(billing.plan_name), ' ', ''), '_', ''), '-', ''), '+', 'plus')) IN ('free', 'grokfree', 'freetier', 'basic', 'grokbasic', 'xbasic'))`
 	accountPaidBillingSignals   = `(` + accountPaidPlanSignal + ` OR billing.monthly_limit > 0 OR billing.on_demand_cap > 0 OR billing.on_demand_used > 0 OR billing.prepaid_balance > 0)`
 	accountPaidBillingPredicate = `EXISTS (SELECT 1 FROM account_billing_snapshots billing WHERE billing.account_id = provider_accounts.id AND ` + accountPaidBillingSignals + `)`
@@ -522,12 +525,16 @@ func (r *AccountRepository) getRoutingEgressLeaseBlocks(ctx context.Context, pro
 		Table("account_egress_lease_blocks AS block").
 		Select("block.*").
 		Joins("JOIN provider_accounts AS account ON account.id = block.account_id").
-		Where("account.provider = ? AND account.enabled = ? AND account.auth_status = ? AND account.egress_node_id = block.node_id AND block.cooldown_until > ?", provider, true, account.AuthStatusActive, now.UTC()).
+		Where("account.provider = ? AND account.enabled = ? AND account.auth_status = ? AND (account.egress_node_id IS NULL OR account.egress_node_id = block.node_id) AND block.cooldown_until > ?", provider, true, account.AuthStatusActive, now.UTC()).
 		Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	for _, row := range rows {
-		result[row.AccountID] = egressLeaseBlockFromModel(row)
+		block := egressLeaseBlockFromModel(row)
+		current, exists := result[row.AccountID]
+		if !exists || block.CooldownUntil.After(current.CooldownUntil) {
+			result[row.AccountID] = block
+		}
 	}
 	return result, nil
 }
@@ -677,11 +684,13 @@ func (r *AccountRepository) getRoutingQuotaWindows(ctx context.Context, provider
 	if provider != account.ProviderWeb && quotaMode == "" {
 		return result, nil
 	}
-	modes := make([]string, 0, 2)
-	// Paid Web chat routes are governed by the shared weekly pool. Imagine
-	// products have independent authoritative windows and must not be hidden by
-	// a weekly row merely because the same account also has paid chat access.
-	if provider == account.ProviderWeb && !account.IsWebImagineQuotaMode(quotaMode) {
+	modes := make([]string, 0, 3)
+	webImagineMode := provider == account.ProviderWeb && account.IsWebImagineQuotaMode(quotaMode)
+	// Paid Web routes use the shared weekly pool. Imagine may additionally
+	// expose a product-specific remainingQueries window (notably for Basic and
+	// older response shapes); load both and prefer the exact product window
+	// below, falling back to weekly only for confirmed Super/Heavy accounts.
+	if provider == account.ProviderWeb {
 		modes = append(modes, "weekly")
 	}
 	if provider == account.ProviderWeb && quotaMode == account.QuotaModeWebImageEdit {
@@ -708,10 +717,23 @@ func (r *AccountRepository) getRoutingQuotaWindows(ctx context.Context, provider
 		webTiers[credential.ID] = credential.WebTier
 	}
 	for _, row := range rows {
-		if provider == account.ProviderWeb && quotaMode == account.QuotaModeWebImageEdit {
-			if row.Mode != webImageEditRoutingQuotaMode(webTiers[row.AccountID]) {
-				continue
+		if webImagineMode {
+			tier := webTiers[row.AccountID]
+			productMode := quotaMode
+			if quotaMode == account.QuotaModeWebImageEdit {
+				productMode = webImageEditRoutingQuotaMode(tier)
 			}
+			switch {
+			case row.Mode == productMode:
+				// An explicit product window is more precise than the shared pool,
+				// regardless of query order.
+				result[row.AccountID] = toRoutingQuotaWindowDomain(row)
+			case row.Mode == "weekly" && (tier == account.WebTierSuper || tier == account.WebTierHeavy):
+				if existing, exists := result[row.AccountID]; !exists || existing.Mode != productMode {
+					result[row.AccountID] = toRoutingQuotaWindowDomain(row)
+				}
+			}
+			continue
 		}
 		if _, exists := result[row.AccountID]; !exists {
 			result[row.AccountID] = toRoutingQuotaWindowDomain(row)
@@ -2249,7 +2271,7 @@ func (r *AccountRepository) ListEgressLeaseBlocks(ctx context.Context, limit int
 		Table("account_egress_lease_blocks AS block").Select("block.*").
 		Joins("JOIN provider_accounts AS account ON account.id = block.account_id").
 		Joins("JOIN egress_nodes AS node ON node.id = block.node_id").
-		Where("account.provider = ? AND account.enabled = ? AND account.auth_status = ? AND account.egress_node_id = block.node_id AND node.enabled = ? AND node.scope = ?", account.ProviderBuild, true, account.AuthStatusActive, true, "grok_build").
+		Where("account.provider = ? AND account.enabled = ? AND account.auth_status = ? AND (account.egress_node_id IS NULL OR account.egress_node_id = block.node_id) AND node.enabled = ? AND node.scope = ?", account.ProviderBuild, true, account.AuthStatusActive, true, "grok_build").
 		Order("block.cooldown_until ASC, block.account_id ASC, block.node_id ASC").Limit(limit)
 	if after != nil {
 		cursorTime := after.CooldownUntil.UTC()
@@ -2273,7 +2295,10 @@ func deleteInvalidEgressLeaseBlocksForAccount(tx *gorm.DB, row accountModel) (in
 		return 0, nil
 	}
 	query := tx.Where("account_id = ?", row.ID)
-	if row.Enabled && account.AuthStatus(row.AuthStatus) == account.AuthStatusActive && row.EgressNodeID != nil {
+	if row.Enabled && account.AuthStatus(row.AuthStatus) == account.AuthStatusActive {
+		if row.EgressNodeID == nil {
+			return 0, nil
+		}
 		query = query.Where("node_id <> ?", *row.EgressNodeID)
 	}
 	result := query.Delete(&accountEgressLeaseBlockModel{})
@@ -2289,7 +2314,7 @@ func (r *AccountRepository) PruneInvalidEgressLeaseBlocks(ctx context.Context, l
 		Table("account_egress_lease_blocks AS block").Select("block.*").
 		Joins("LEFT JOIN provider_accounts AS account ON account.id = block.account_id").
 		Joins("LEFT JOIN egress_nodes AS node ON node.id = block.node_id").
-		Where("account.id IS NULL OR account.provider <> ? OR account.enabled <> ? OR account.auth_status <> ? OR account.egress_node_id IS NULL OR account.egress_node_id <> block.node_id OR node.id IS NULL OR node.enabled <> ? OR node.scope <> ?", account.ProviderBuild, true, account.AuthStatusActive, true, "grok_build").
+		Where("account.id IS NULL OR account.provider <> ? OR account.enabled <> ? OR account.auth_status <> ? OR (account.egress_node_id IS NOT NULL AND account.egress_node_id <> block.node_id) OR node.id IS NULL OR node.enabled <> ? OR node.scope <> ?", account.ProviderBuild, true, account.AuthStatusActive, true, "grok_build").
 		Order("block.cooldown_until ASC, block.account_id ASC, block.node_id ASC").Limit(limit).Find(&rows).Error
 	if err != nil || len(rows) == 0 {
 		return 0, err
@@ -2327,9 +2352,10 @@ func (r *AccountRepository) DeleteEgressLeaseBlocksByNodes(ctx context.Context, 
 	return result.RowsAffected, result.Error
 }
 
-// UpsertEgressLeaseBlock atomically verifies that the Build account is still
-// bound to the requested node. A shorter concurrent hold cannot replace a
-// longer one or rotate its CAS version.
+// UpsertEgressLeaseBlock atomically verifies that the Build account may still
+// use the observed node. Unbound accounts can receive a runtime-selected
+// account-derived proxy; explicit bindings remain authoritative. A shorter
+// concurrent hold cannot replace a longer one or rotate its CAS version.
 func (r *AccountRepository) UpsertEgressLeaseBlock(ctx context.Context, value account.EgressLeaseBlock) (account.EgressLeaseBlock, error) {
 	value.Reason = strings.TrimSpace(value.Reason)
 	value.Version = strings.TrimSpace(value.Version)
@@ -2345,7 +2371,7 @@ func (r *AccountRepository) UpsertEgressLeaseBlock(ctx context.Context, value ac
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id", "provider", "enabled", "auth_status", "egress_node_id").First(&owner, value.AccountID).Error; err != nil {
 			return mapError(err)
 		}
-		if account.Provider(owner.Provider) != account.ProviderBuild || !owner.Enabled || account.AuthStatus(owner.AuthStatus) != account.AuthStatusActive || owner.EgressNodeID == nil || *owner.EgressNodeID != value.NodeID {
+		if account.Provider(owner.Provider) != account.ProviderBuild || !owner.Enabled || account.AuthStatus(owner.AuthStatus) != account.AuthStatusActive || (owner.EgressNodeID != nil && *owner.EgressNodeID != value.NodeID) {
 			return repository.ErrConflict
 		}
 		var existing accountEgressLeaseBlockModel

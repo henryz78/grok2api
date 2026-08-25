@@ -30,7 +30,6 @@ import {
   type EgressFallbackMode,
   type EgressNodeDTO,
   type EgressOperationsConfigDTO,
-  type EgressOperationsConfigInput,
   type EgressScope,
   type EgressSourceDTO,
   type EgressSourceInput,
@@ -44,10 +43,6 @@ import { Pagination } from "@/shared/components/pagination";
 import { VirtualTableBody } from "@/shared/components/virtual-table-body";
 
 type SourceForm = Omit<EgressSourceInput, "url" | "proxyURL" | "clearProxyURL"> & { url: string; proxyEnabled: boolean; proxyURL: string };
-type OperationsForm = Omit<EgressOperationsConfigDTO, "updatedAt"> & {
-  subscriptionProxyURL: string;
-  clearSubscriptionProxy: boolean;
-};
 const emptySource: SourceForm = {
   name: "", scope: "grok_build", enabled: true, url: "", proxyEnabled: false, proxyURL: "", refreshIntervalSeconds: 900, defaultAccountCapacity: 0,
 };
@@ -71,11 +66,11 @@ function defaultFallbacks(): Record<EgressScope, EgressFallbackConfigDTO> {
   };
 }
 
-const defaultOperationsForm: OperationsForm = {
-  probeProvider: "cloudflare", probeIntervalSeconds: 900, autoAssignEnabled: false, autoBalanceEnabled: false, assignmentIntervalSeconds: 300, fallbacks: defaultFallbacks(), subscriptionProxyURL: "", subscriptionProxyConfigured: false, clearSubscriptionProxy: false,
+const defaultOperationsForm: Omit<EgressOperationsConfigDTO, "updatedAt"> = {
+  probeProvider: "cloudflare", probeIntervalSeconds: 900, autoAssignEnabled: false, autoBalanceEnabled: false, assignmentIntervalSeconds: 300, fallbacks: defaultFallbacks(),
 };
 
-function operationsFormFrom(value?: EgressOperationsConfigDTO): OperationsForm {
+function operationsFormFrom(value?: EgressOperationsConfigDTO): Omit<EgressOperationsConfigDTO, "updatedAt"> {
   if (!value) return { ...defaultOperationsForm, fallbacks: defaultFallbacks() };
 
   const defaults = defaultFallbacks();
@@ -92,24 +87,7 @@ function operationsFormFrom(value?: EgressOperationsConfigDTO): OperationsForm {
       grok_web_asset: { ...defaults.grok_web_asset, ...value.fallbacks.grok_web_asset },
       grok_console_asset: { ...defaults.grok_console_asset, ...value.fallbacks.grok_console_asset },
     },
-    subscriptionProxyURL: "",
-    subscriptionProxyConfigured: value.subscriptionProxyConfigured,
-    clearSubscriptionProxy: false,
   };
-}
-
-function operationsInputFrom(value: OperationsForm): EgressOperationsConfigInput {
-  const result: EgressOperationsConfigInput = {
-    probeProvider: value.probeProvider,
-    probeIntervalSeconds: value.probeIntervalSeconds,
-    autoAssignEnabled: value.autoAssignEnabled,
-    autoBalanceEnabled: value.autoBalanceEnabled,
-    assignmentIntervalSeconds: value.assignmentIntervalSeconds,
-    fallbacks: value.fallbacks,
-  };
-  if (value.clearSubscriptionProxy) result.clearSubscriptionProxy = true;
-  else if (value.subscriptionProxyURL.trim()) result.subscriptionProxyURL = value.subscriptionProxyURL.trim();
-  return result;
 }
 
 async function testAllEgressNodes() {
@@ -138,8 +116,7 @@ async function testAllEgressNodes() {
 export function EgressAutomation({ scopeLabel }: { scopeLabel: (scope: EgressScope) => string }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const [operationsDraft, setOperationsDraft] = useState<OperationsForm | null>(null);
-  const [subscriptionProxyError, setSubscriptionProxyError] = useState("");
+  const [operationsDraft, setOperationsDraft] = useState<Omit<EgressOperationsConfigDTO, "updatedAt"> | null>(null);
   const operationsQuery = useQuery({ queryKey: ["egress-operations"], queryFn: getEgressOperationsConfig });
   const nodesQuery = useQuery({ queryKey: ["egress-nodes", "fallback-options"], queryFn: () => listAllEgressNodes() });
   const operationsForm = operationsDraft ?? operationsFormFrom(operationsQuery.data);
@@ -163,7 +140,7 @@ export function EgressAutomation({ scopeLabel }: { scopeLabel: (scope: EgressSco
     onError: showError,
   });
   const saveOperations = useMutation({
-    mutationFn: () => updateEgressOperationsConfig(operationsInputFrom(operationsForm)),
+    mutationFn: () => updateEgressOperationsConfig(operationsForm),
     onSuccess: () => { setOperationsDraft(null); invalidate(); toast.success(t("settings.egress.automationSaved")); },
     onError: showError,
   });
@@ -188,7 +165,7 @@ export function EgressAutomation({ scopeLabel }: { scopeLabel: (scope: EgressSco
         <OperationSectionHeader title={t("settings.egress.automation")} help={t("settings.egress.automationHelp")}>
           <ActionTooltip label={t("settings.egress.testAllHelp")}><Button type="button" size="sm" variant="secondary" disabled={testAll.isPending} onClick={() => testAll.mutate()}>{testAll.isPending ? <Spinner /> : <Network />}{t("settings.egress.testAll")}</Button></ActionTooltip>
           <ActionTooltip label={t("settings.egress.rebalanceHelp")}><Button type="button" size="sm" variant="secondary" disabled={rebalance.isPending} onClick={() => rebalance.mutate()}>{rebalance.isPending ? <Spinner /> : <Shuffle />}{t("settings.egress.rebalance")}</Button></ActionTooltip>
-          <ActionTooltip label={t("settings.egress.saveAutomationHelp")}><Button type="button" size="sm" disabled={operationsDraft === null || Boolean(subscriptionProxyError) || saveOperations.isPending} onClick={() => saveOperations.mutate()}>{saveOperations.isPending ? <Spinner /> : null}{t("common.save")}</Button></ActionTooltip>
+          <ActionTooltip label={t("settings.egress.saveAutomationHelp")}><Button type="button" size="sm" disabled={operationsDraft === null || saveOperations.isPending} onClick={() => saveOperations.mutate()}>{saveOperations.isPending ? <Spinner /> : null}{t("common.save")}</Button></ActionTooltip>
         </OperationSectionHeader>
 
         {operationsQuery.isError ? <ErrorState message={operationsQuery.error.message} onRetry={() => void operationsQuery.refetch()} /> : operationsQuery.isPending ? <LoadingState /> : (
@@ -213,43 +190,6 @@ export function EgressAutomation({ scopeLabel }: { scopeLabel: (scope: EgressSco
             </AutomationRow>
             <AutomationRow controlId="egress-auto-balance" label={t("settings.egress.autoBalance")} description={t("settings.egress.autoBalanceHelp")}>
               <div className="flex h-8 items-center"><Switch id="egress-auto-balance" checked={operationsForm.autoBalanceEnabled} onCheckedChange={(autoBalanceEnabled) => setOperationsDraft({ ...operationsForm, autoBalanceEnabled })} /></div>
-            </AutomationRow>
-            <AutomationRow controlId="egress-subscription-proxy" label={t("settings.egress.subscriptionProxy")} description={t("settings.egress.subscriptionProxyHelp")} error={subscriptionProxyError}>
-              <div className="space-y-2">
-                <div className="flex min-w-0 gap-2">
-                  <Input
-                    id="egress-subscription-proxy"
-                    placeholder="socks5h://user:pass@host:port"
-                    value={operationsForm.subscriptionProxyURL}
-                    onChange={(event) => {
-                      const value = event.target.value;
-                      setOperationsDraft({ ...operationsForm, subscriptionProxyURL: value, clearSubscriptionProxy: false });
-                      setSubscriptionProxyError(value.trim() && !validSubscriptionProxyURL(value) ? t("settings.egress.invalidProxy") : "");
-                    }}
-                  />
-                  {operationsForm.subscriptionProxyConfigured ? (
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant={operationsForm.clearSubscriptionProxy ? "secondary" : "outline"}
-                      onClick={() => {
-                        setOperationsDraft({ ...operationsForm, subscriptionProxyURL: "", clearSubscriptionProxy: !operationsForm.clearSubscriptionProxy });
-                        setSubscriptionProxyError("");
-                      }}
-                    >
-                      {operationsForm.clearSubscriptionProxy ? t("settings.egress.cancelClearSubscriptionProxy") : t("settings.egress.clearSubscriptionProxy")}
-                    </Button>
-                  ) : null}
-                </div>
-                {operationsForm.subscriptionProxyConfigured ? (
-                  <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                    <Badge variant={operationsForm.clearSubscriptionProxy ? "destructive" : "secondary"}>
-                      {operationsForm.clearSubscriptionProxy ? t("settings.egress.subscriptionProxyClearPending") : t("settings.egress.configured")}
-                    </Badge>
-                    {!operationsForm.clearSubscriptionProxy && !operationsForm.subscriptionProxyURL ? <span>{t("settings.egress.keepConfigured")}</span> : null}
-                  </div>
-                ) : null}
-              </div>
             </AutomationRow>
             <div className="pt-4">
               <div className="flex items-center gap-1.5 px-0.5">
